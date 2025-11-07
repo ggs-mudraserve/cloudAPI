@@ -308,9 +308,46 @@ async function getCampaign(campaignId) {
     }
   });
 
+  // Get send statistics per template from send_queue
+  const { data: queueStats, error: queueError } = await supabase
+    .from('send_queue')
+    .select('template_name, status')
+    .eq('campaign_id', campaignId);
+
+  if (queueError) throw queueError;
+
+  // Calculate send stats per template
+  const templateStats = {};
+  (queueStats || []).forEach(item => {
+    if (!item.template_name) return;
+
+    if (!templateStats[item.template_name]) {
+      templateStats[item.template_name] = {
+        sent: 0,
+        failed: 0,
+        ready: 0,
+        processing: 0,
+        total: 0
+      };
+    }
+
+    templateStats[item.template_name].total++;
+
+    if (item.status === 'sent') {
+      templateStats[item.template_name].sent++;
+    } else if (item.status === 'failed') {
+      templateStats[item.template_name].failed++;
+    } else if (item.status === 'ready') {
+      templateStats[item.template_name].ready++;
+    } else if (item.status === 'processing') {
+      templateStats[item.template_name].processing++;
+    }
+  });
+
   return {
     ...campaign,
-    distribution
+    distribution,
+    templateStats
   };
 }
 

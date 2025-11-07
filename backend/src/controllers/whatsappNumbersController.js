@@ -1,5 +1,5 @@
 const { supabase } = require('../config/supabase');
-const { testConnection } = require('../services/whatsappService');
+const { testConnection, getBusinessProfile } = require('../services/whatsappService');
 
 /**
  * Test WhatsApp Cloud API connection
@@ -73,7 +73,9 @@ async function listWhatsAppNumbers(req, res) {
       last_updated: num.last_updated,
       quality_rating: num.quality_rating,
       tier: num.tier,
-      is_active: num.is_active
+      is_active: num.is_active,
+      profile_picture_url: num.profile_picture_url,
+      verified_name: num.verified_name
     }));
 
     res.json({
@@ -132,7 +134,9 @@ async function getWhatsAppNumber(req, res) {
       last_updated: data.last_updated,
       quality_rating: data.quality_rating,
       tier: data.tier,
-      is_active: data.is_active
+      is_active: data.is_active,
+      profile_picture_url: data.profile_picture_url,
+      verified_name: data.verified_name
     };
 
     res.json({
@@ -228,7 +232,9 @@ async function addWhatsAppNumber(req, res) {
       last_stable_rate_per_sec: data.last_stable_rate_per_sec,
       quality_rating: data.quality_rating,
       tier: data.tier,
-      is_active: data.is_active
+      is_active: data.is_active,
+      profile_picture_url: data.profile_picture_url,
+      verified_name: data.verified_name
     };
 
     res.status(201).json({
@@ -350,11 +356,100 @@ async function updateWhatsAppNumber(req, res) {
   }
 }
 
+/**
+ * Sync WhatsApp business profile
+ * Fetches profile picture and verified name from WhatsApp Cloud API
+ */
+async function syncProfile(req, res) {
+  try {
+    const { id } = req.params;
+
+    // Get WhatsApp number details including access token
+    const { data: whatsappNumber, error: fetchError } = await supabase
+      .from('whatsapp_numbers')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !whatsappNumber) {
+      return res.status(404).json({
+        error: 'Not Found',
+        message: 'WhatsApp number not found'
+      });
+    }
+
+    // Fetch business profile from WhatsApp API
+    const profileResult = await getBusinessProfile(
+      whatsappNumber.phone_number_id,
+      whatsappNumber.access_token,
+      whatsappNumber.waba_id
+    );
+
+    if (!profileResult.success) {
+      return res.status(400).json({
+        error: 'Sync Failed',
+        message: profileResult.error,
+        code: profileResult.errorCode
+      });
+    }
+
+    // Update database with profile info
+    const { data: updatedNumber, error: updateError } = await supabase
+      .from('whatsapp_numbers')
+      .update({
+        profile_picture_url: profileResult.data.profile_picture_url,
+        verified_name: profileResult.data.verified_name,
+        display_name: profileResult.data.verified_name || whatsappNumber.display_name
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('Update profile error:', updateError);
+      return res.status(500).json({
+        error: 'Database Error',
+        message: 'Failed to update profile information'
+      });
+    }
+
+    // Create a helpful message based on name_status
+    let message = 'Profile synced successfully';
+    const nameStatus = profileResult.data.name_status;
+
+    if (nameStatus === 'PENDING_REVIEW') {
+      message = 'Profile synced. Note: Display name change is pending Meta approval.';
+    } else if (nameStatus === 'DECLINED') {
+      message = 'Profile synced. Warning: Display name change was declined by Meta.';
+    }
+
+    res.json({
+      success: true,
+      message,
+      data: {
+        id: updatedNumber.id,
+        verified_name: updatedNumber.verified_name,
+        profile_picture_url: updatedNumber.profile_picture_url,
+        display_name: updatedNumber.display_name,
+        name_status: nameStatus
+      }
+    });
+
+  } catch (error) {
+    console.error('Sync profile exception:', error);
+    res.status(500).json({
+      error: 'Internal Server Error',
+      message: 'Failed to sync profile'
+    });
+  }
+}
+
 module.exports = {
   testWhatsAppConnection,
   listWhatsAppNumbers,
   getWhatsAppNumber,
   addWhatsAppNumber,
   deleteWhatsAppNumber,
-  updateWhatsAppNumber
+  updateWhatsAppNumber,
+  syncProfile
 };

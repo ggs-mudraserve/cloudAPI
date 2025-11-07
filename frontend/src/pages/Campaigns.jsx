@@ -13,6 +13,8 @@ const Campaigns = () => {
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [error, setError] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
+  const [selectedCampaign, setSelectedCampaign] = useState(null);
+  const [showDetailsModal, setShowDetailsModal] = useState(false);
 
   // Form state
   const [formData, setFormData] = useState({
@@ -239,6 +241,17 @@ const Campaigns = () => {
     } catch (err) {
       console.error('Delete campaign error:', err);
       setError(err.response?.data?.message || 'Failed to delete campaign');
+    }
+  };
+
+  const viewCampaignDetails = async (campaignId) => {
+    try {
+      const result = await campaignsAPI.get(campaignId);
+      setSelectedCampaign(result.data);
+      setShowDetailsModal(true);
+    } catch (err) {
+      console.error('Failed to load campaign details:', err);
+      setError(err.response?.data?.message || 'Failed to load campaign details');
     }
   };
 
@@ -641,6 +654,12 @@ const Campaigns = () => {
                       </div>
                     </div>
                     <div className="ml-6 flex space-x-2">
+                      <button
+                        onClick={() => viewCampaignDetails(campaign.id)}
+                        className="inline-flex items-center px-3 py-2 border border-blue-300 text-sm font-medium rounded-md text-blue-700 bg-white hover:bg-blue-50"
+                      >
+                        View Details
+                      </button>
                       {campaign.status === 'running' && (
                         <button
                           onClick={() => handleStopCampaign(campaign.id)}
@@ -673,6 +692,106 @@ const Campaigns = () => {
           </div>
         )}
       </div>
+
+      {/* Campaign Details Modal */}
+      {showDetailsModal && selectedCampaign && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full z-50">
+          <div className="relative top-20 mx-auto p-5 border w-11/12 max-w-4xl shadow-lg rounded-md bg-white">
+            <div className="flex justify-between items-start mb-4">
+              <h3 className="text-lg font-medium text-gray-900">
+                Campaign Details: {selectedCampaign.name}
+              </h3>
+              <button
+                onClick={() => setShowDetailsModal(false)}
+                className="text-gray-400 hover:text-gray-500"
+              >
+                <span className="text-2xl">&times;</span>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4 mb-6 text-sm">
+              <div>
+                <span className="font-medium">Status:</span> {selectedCampaign.status}
+              </div>
+              <div>
+                <span className="font-medium">Total Contacts:</span> {selectedCampaign.total_contacts}
+              </div>
+              <div>
+                <span className="font-medium">Sent:</span> {selectedCampaign.total_sent}
+              </div>
+              <div>
+                <span className="font-medium">Failed:</span> {selectedCampaign.total_failed}
+              </div>
+            </div>
+
+            {/* Template Breakdown */}
+            {selectedCampaign.templateStats && Object.keys(selectedCampaign.templateStats).length > 0 && (
+              <div className="mt-6">
+                <h4 className="text-md font-medium text-gray-900 mb-3">Template-wise Breakdown</h4>
+                <div className="overflow-x-auto">
+                  <table className="min-w-full divide-y divide-gray-200">
+                    <thead className="bg-gray-50">
+                      <tr>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Template Name
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Total
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Sent
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Failed
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Ready
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Processing
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="bg-white divide-y divide-gray-200">
+                      {Object.entries(selectedCampaign.templateStats).map(([templateName, stats]) => (
+                        <tr key={templateName}>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                            {templateName}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            {stats.total}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-green-600">
+                            {stats.sent}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-red-600">
+                            {stats.failed}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-blue-600">
+                            {stats.ready}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-yellow-600">
+                            {stats.processing}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            <div className="mt-6 flex justify-end">
+              <button
+                onClick={() => setShowDetailsModal(false)}
+                className="px-4 py-2 bg-gray-200 text-gray-700 rounded-md hover:bg-gray-300"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

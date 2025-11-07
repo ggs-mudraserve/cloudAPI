@@ -62,8 +62,9 @@ async function testConnection(phoneNumberId, accessToken) {
  * @param {string} templateName - Template name
  * @param {string} language - Template language code (e.g., 'en')
  * @param {object} variables - Template variables object (e.g., { var1: 'value1', var2: 'value2' })
+ * @param {array} templateComponents - Template components from database (to determine media header)
  */
-async function sendTemplateMessage(phoneNumberId, accessToken, to, templateName, language, variables = {}) {
+async function sendTemplateMessage(phoneNumberId, accessToken, to, templateName, language, variables = {}, templateComponents = []) {
   try {
     // Clean inputs
     const cleanToken = accessToken.replace(/\s+/g, '').trim();
@@ -73,12 +74,41 @@ async function sendTemplateMessage(phoneNumberId, accessToken, to, templateName,
     // Build template components with variables
     const components = [];
 
-    // Check if there are variables to include
+    // Get variable values in order (var1, var2, var3, ...)
     const variableValues = Object.values(variables);
-    if (variableValues.length > 0) {
+    let currentVarIndex = 0;
+
+    // Check if template has media header (VIDEO, IMAGE, or DOCUMENT)
+    const headerComponent = templateComponents.find(c => c.type === 'HEADER');
+    const hasMediaHeader = headerComponent &&
+      (headerComponent.format === 'VIDEO' || headerComponent.format === 'IMAGE' || headerComponent.format === 'DOCUMENT');
+
+    // If template has media header, use var1 for header
+    if (hasMediaHeader && variableValues.length > 0) {
+      const mediaUrl = variableValues[currentVarIndex];
+      currentVarIndex++;
+
+      let mediaType = 'video'; // Default
+      if (headerComponent.format === 'IMAGE') mediaType = 'image';
+      else if (headerComponent.format === 'DOCUMENT') mediaType = 'document';
+
+      components.push({
+        type: 'header',
+        parameters: [{
+          type: mediaType,
+          [mediaType]: {
+            link: String(mediaUrl)
+          }
+        }]
+      });
+    }
+
+    // Remaining variables go to body as text parameters
+    const bodyVariables = variableValues.slice(currentVarIndex);
+    if (bodyVariables.length > 0) {
       components.push({
         type: 'body',
-        parameters: variableValues.map(value => ({
+        parameters: bodyVariables.map(value => ({
           type: 'text',
           text: String(value)
         }))
@@ -255,10 +285,66 @@ async function markMessageAsRead(phoneNumberId, accessToken, messageId) {
   }
 }
 
+/**
+ * Get WhatsApp Business Profile info (display name and profile picture)
+ */
+async function getBusinessProfile(phoneNumberId, accessToken, wabaId) {
+  try {
+    const cleanToken = accessToken.replace(/\s+/g, '').trim();
+    const cleanPhoneId = phoneNumberId.replace(/\s+/g, '').trim();
+
+    // Get the phone number details for verified_name and name status
+    const phoneResponse = await axios.get(
+      `${WHATSAPP_API_BASE}/${cleanPhoneId}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${cleanToken}`
+        },
+        params: {
+          fields: 'verified_name,display_phone_number,name_status'
+        }
+      }
+    );
+
+    // Get business profile info (profile picture is here, not on phone number object)
+    const profileResponse = await axios.get(
+      `${WHATSAPP_API_BASE}/${cleanPhoneId}/whatsapp_business_profile`,
+      {
+        headers: {
+          'Authorization': `Bearer ${cleanToken}`
+        },
+        params: {
+          fields: 'profile_picture_url,about,description,email'
+        }
+      }
+    );
+
+    return {
+      success: true,
+      data: {
+        verified_name: phoneResponse.data.verified_name,
+        display_phone_number: phoneResponse.data.display_phone_number,
+        name_status: phoneResponse.data.name_status || 'UNKNOWN',
+        profile_picture_url: profileResponse.data.data?.[0]?.profile_picture_url || null,
+        about: profileResponse.data.data?.[0]?.about || null
+      }
+    };
+  } catch (error) {
+    console.error('WhatsApp get business profile error:', error.response?.data || error.message);
+
+    return {
+      success: false,
+      error: error.response?.data?.error?.message || 'Failed to fetch business profile',
+      errorCode: error.response?.data?.error?.code
+    };
+  }
+}
+
 module.exports = {
   testConnection,
   sendTemplateMessage,
   sendTextMessage,
   fetchTemplates,
-  markMessageAsRead
+  markMessageAsRead,
+  getBusinessProfile
 };

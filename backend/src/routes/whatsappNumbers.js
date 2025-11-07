@@ -6,7 +6,8 @@ const {
   getWhatsAppNumber,
   addWhatsAppNumber,
   deleteWhatsAppNumber,
-  updateWhatsAppNumber
+  updateWhatsAppNumber,
+  syncProfile
 } = require('../controllers/whatsappNumbersController');
 const { validateJWT } = require('../middleware/auth');
 
@@ -47,6 +48,13 @@ router.post('/', addWhatsAppNumber);
  * @access  Private
  */
 router.put('/:id', updateWhatsAppNumber);
+
+/**
+ * @route   POST /api/whatsapp-numbers/:id/sync-profile
+ * @desc    Sync WhatsApp business profile (picture and verified name)
+ * @access  Private
+ */
+router.post('/:id/sync-profile', syncProfile);
 
 /**
  * @route   DELETE /api/whatsapp-numbers/:id

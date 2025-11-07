@@ -144,7 +144,8 @@ async function processMessage(message, whatsappNumber, rateState) {
       message.phone,
       message.template_name,
       template.language,
-      message.payload
+      message.payload,
+      template.components // Pass template components to properly structure media vs body parameters
     );
 
     if (result.success) {
@@ -390,8 +391,8 @@ async function processCampaignQueue(campaignId) {
       .limit(1);
 
     if (remainingMessages && remainingMessages.length > 0) {
-      // Continue processing
-      setTimeout(() => processCampaignQueue(campaignId), 1000);
+      // Continue processing immediately (rate limiting is already applied per-message)
+      setImmediate(() => processCampaignQueue(campaignId));
     } else {
       // Check if campaign is complete
       console.log(`[Queue] Checking if campaign ${campaignId} is complete...`);

@@ -40,5 +40,11 @@ export const whatsappNumbersAPI = {
   delete: async (id) => {
     const response = await api.delete(`/whatsapp-numbers/${id}`);
     return response.data;
+  },
+
+  // Sync WhatsApp business profile
+  syncProfile: async (id) => {
+    const response = await api.post(`/whatsapp-numbers/${id}/sync-profile`);
+    return response.data;
   }
 };
