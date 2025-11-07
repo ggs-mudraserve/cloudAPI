@@ -60,7 +60,7 @@ async function listWhatsAppNumbers(req, res) {
       });
     }
 
-    // Don't return access tokens to frontend
+    // Don't return access tokens or app_secret to frontend
     const sanitizedData = data.map(num => ({
       id: num.id,
       number: num.number,
@@ -75,7 +75,8 @@ async function listWhatsAppNumbers(req, res) {
       tier: num.tier,
       is_active: num.is_active,
       profile_picture_url: num.profile_picture_url,
-      verified_name: num.verified_name
+      verified_name: num.verified_name,
+      app_id: num.app_id
     }));
 
     res.json({
@@ -121,7 +122,7 @@ async function getWhatsAppNumber(req, res) {
       });
     }
 
-    // Don't return access token
+    // Don't return access token or app_secret
     const sanitizedData = {
       id: data.id,
       number: data.number,
@@ -136,7 +137,8 @@ async function getWhatsAppNumber(req, res) {
       tier: data.tier,
       is_active: data.is_active,
       profile_picture_url: data.profile_picture_url,
-      verified_name: data.verified_name
+      verified_name: data.verified_name,
+      app_id: data.app_id
     };
 
     res.json({
@@ -165,7 +167,9 @@ async function addWhatsAppNumber(req, res) {
       phone_number_id,
       waba_id,
       access_token,
-      system_prompt
+      system_prompt,
+      app_id,
+      app_secret
     } = req.body;
 
     // Validate required fields
@@ -173,6 +177,21 @@ async function addWhatsAppNumber(req, res) {
       return res.status(400).json({
         error: 'Bad Request',
         message: 'number, phone_number_id, waba_id, and access_token are required'
+      });
+    }
+
+    // Validate app credentials if provided
+    if (app_id && !app_secret) {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: 'app_secret is required when app_id is provided'
+      });
+    }
+
+    if (app_secret && !app_id) {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: 'app_id is required when app_secret is provided'
       });
     }
 
@@ -199,7 +218,9 @@ async function addWhatsAppNumber(req, res) {
         system_prompt: system_prompt || 'You are a helpful assistant.',
         quality_rating: testResult.data.quality_rating,
         tier: testResult.data.tier,
-        is_active: true
+        is_active: true,
+        app_id: app_id || null,
+        app_secret: app_secret || null
       }])
       .select()
       .single();
@@ -220,7 +241,7 @@ async function addWhatsAppNumber(req, res) {
       });
     }
 
-    // Don't return access token
+    // Don't return access token or app_secret
     const sanitizedData = {
       id: data.id,
       number: data.number,
@@ -234,7 +255,8 @@ async function addWhatsAppNumber(req, res) {
       tier: data.tier,
       is_active: data.is_active,
       profile_picture_url: data.profile_picture_url,
-      verified_name: data.verified_name
+      verified_name: data.verified_name,
+      app_id: data.app_id
     };
 
     res.status(201).json({

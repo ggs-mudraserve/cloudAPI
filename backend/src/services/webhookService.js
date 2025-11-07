@@ -14,22 +14,46 @@ const STATUS_HIERARCHY = {
 };
 
 /**
- * Verify Meta webhook signature
+ * Verify Meta webhook signature using per-number app_secret
  * @param {string} signature - X-Hub-Signature-256 header value
  * @param {string} body - Raw request body
- * @returns {boolean}
+ * @param {string} phoneNumberId - WhatsApp Phone Number ID to identify which app_secret to use
+ * @returns {Promise<boolean>}
  */
-function verifyWebhookSignature(signature, body) {
+async function verifyWebhookSignature(signature, body, phoneNumberId) {
   if (!signature) {
     console.log('[Webhook] No signature provided');
     return false;
   }
 
-  const appSecret = process.env.META_APP_SECRET || process.env.META_ACCESS_TOKEN;
-  if (!appSecret) {
-    console.error('[Webhook] META_APP_SECRET not configured');
+  if (!phoneNumberId) {
+    console.error('[Webhook] No phoneNumberId provided for signature verification');
     return false;
   }
+
+  // Fetch app_secret from database for this specific phone number
+  const { data: whatsappNumber, error } = await supabase
+    .from('whatsapp_numbers')
+    .select('app_secret')
+    .eq('phone_number_id', phoneNumberId)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[Webhook] Error fetching app_secret:', error);
+    return false;
+  }
+
+  if (!whatsappNumber || !whatsappNumber.app_secret) {
+    // Fallback to global META_APP_SECRET for backward compatibility
+    const appSecret = process.env.META_APP_SECRET;
+    if (!appSecret) {
+      console.error('[Webhook] No app_secret found for phone_number_id:', phoneNumberId);
+      return false;
+    }
+    console.log('[Webhook] Using global META_APP_SECRET (fallback) for phone_number_id:', phoneNumberId);
+  }
+
+  const appSecret = whatsappNumber?.app_secret || process.env.META_APP_SECRET;
 
   // Remove 'sha256=' prefix if present
   const signatureHash = signature.startsWith('sha256=')
@@ -47,6 +71,12 @@ function verifyWebhookSignature(signature, body) {
     Buffer.from(signatureHash),
     Buffer.from(expectedHash)
   );
+
+  if (isValid) {
+    console.log('[Webhook] ✅ Signature verified for phone_number_id:', phoneNumberId);
+  } else {
+    console.error('[Webhook] ❌ Signature verification failed for phone_number_id:', phoneNumberId);
+  }
 
   return isValid;
 }

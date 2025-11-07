@@ -49,17 +49,25 @@ exports.handleWebhook = async (req, res) => {
 
     console.log('[Webhook] Event received');
 
-    // Verify signature
-    const isValid = verifyWebhookSignature(signature, rawBody);
+    // Parse webhook data first to extract phone_number_id for signature verification
+    const data = JSON.parse(rawBody);
+
+    // Extract phone_number_id from webhook payload
+    const phoneNumberId = data.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id;
+
+    if (!phoneNumberId) {
+      console.error('[Webhook] ❌ No phone_number_id found in webhook payload - cannot verify signature');
+      return;
+    }
+
+    // Verify signature using per-number app_secret
+    const isValid = await verifyWebhookSignature(signature, rawBody, phoneNumberId);
     if (!isValid) {
       console.error('[Webhook] ❌ Invalid signature - webhook rejected');
       return;
     }
 
     console.log('[Webhook] ✅ Signature verified');
-
-    // Parse webhook data
-    const data = JSON.parse(rawBody);
 
     // Meta sends test webhooks - ignore them
     if (data.object !== 'whatsapp_business_account') {

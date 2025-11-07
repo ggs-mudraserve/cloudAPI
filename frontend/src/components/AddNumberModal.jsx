@@ -7,6 +7,8 @@ const AddNumberModal = ({ onClose, onSuccess }) => {
     display_name: '',
     phone_number_id: '',
     waba_id: '',
+    app_id: '',
+    app_secret: '',
     access_token: '',
     system_prompt: 'You are a helpful assistant.'
   });
@@ -188,6 +190,48 @@ const AddNumberModal = ({ onClose, onSuccess }) => {
                   />
                   <p className="mt-1 text-xs text-gray-500">
                     Get from Meta Developer Console → WhatsApp → Configuration → Business Account ID
+                  </p>
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="app_id"
+                    className="block text-sm font-medium text-gray-700"
+                  >
+                    Meta App ID (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    name="app_id"
+                    id="app_id"
+                    value={formData.app_id}
+                    onChange={handleChange}
+                    className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                    placeholder="123456789012345"
+                  />
+                  <p className="mt-1 text-xs text-gray-500">
+                    Get from Meta App Dashboard → Settings → Basic
+                  </p>
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="app_secret"
+                    className="block text-sm font-medium text-gray-700"
+                  >
+                    Meta App Secret (Optional)
+                  </label>
+                  <input
+                    type="password"
+                    name="app_secret"
+                    id="app_secret"
+                    value={formData.app_secret}
+                    onChange={handleChange}
+                    className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm font-mono text-xs"
+                    placeholder="Enter your Meta App Secret"
+                  />
+                  <p className="mt-1 text-xs text-gray-500">
+                    Used for webhook signature verification - Click "Show" in Meta App Dashboard → Settings → Basic
                   </p>
                 </div>
 
