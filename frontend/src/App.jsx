@@ -2,6 +2,7 @@ import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider } from './contexts/AuthContext';
 import ProtectedRoute from './components/ProtectedRoute';
+import Layout from './components/Layout';
 import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import WhatsAppNumbers from './pages/WhatsAppNumbers';
@@ -19,12 +20,14 @@ function App() {
           {/* Public routes */}
           <Route path="/login" element={<Login />} />
 
-          {/* Protected routes */}
+          {/* Protected routes with Layout */}
           <Route
             path="/dashboard"
             element={
               <ProtectedRoute>
-                <Dashboard />
+                <Layout>
+                  <Dashboard />
+                </Layout>
               </ProtectedRoute>
             }
           />
@@ -33,7 +36,9 @@ function App() {
             path="/whatsapp-numbers"
             element={
               <ProtectedRoute>
-                <WhatsAppNumbers />
+                <Layout>
+                  <WhatsAppNumbers />
+                </Layout>
               </ProtectedRoute>
             }
           />
@@ -42,7 +47,9 @@ function App() {
             path="/templates"
             element={
               <ProtectedRoute>
-                <Templates />
+                <Layout>
+                  <Templates />
+                </Layout>
               </ProtectedRoute>
             }
           />
@@ -51,7 +58,9 @@ function App() {
             path="/campaigns"
             element={
               <ProtectedRoute>
-                <Campaigns />
+                <Layout>
+                  <Campaigns />
+                </Layout>
               </ProtectedRoute>
             }
           />
@@ -60,7 +69,9 @@ function App() {
             path="/inbox"
             element={
               <ProtectedRoute>
-                <Inbox />
+                <Layout>
+                  <Inbox />
+                </Layout>
               </ProtectedRoute>
             }
           />
@@ -69,7 +80,9 @@ function App() {
             path="/settings"
             element={
               <ProtectedRoute>
-                <Settings />
+                <Layout>
+                  <Settings />
+                </Layout>
               </ProtectedRoute>
             }
           />
@@ -78,7 +91,9 @@ function App() {
             path="/notifications"
             element={
               <ProtectedRoute>
-                <Notifications />
+                <Layout>
+                  <Notifications />
+                </Layout>
               </ProtectedRoute>
             }
           />

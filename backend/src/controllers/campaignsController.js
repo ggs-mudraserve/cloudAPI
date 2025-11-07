@@ -317,7 +317,7 @@ exports.getCampaignStats = async (req, res) => {
             sent: { count: 0, percentage: 0 },
             delivered: { count: 0, percentage: 0 },
             read: { count: 0, percentage: 0 },
-            replied: { count: 0, percentage: 0 },
+            replied: { count: 0, percentage: 0 }, // Unique users who replied
             failed: { count: 0, percentage: 0 }
           }
         }
@@ -355,21 +355,35 @@ exports.getCampaignStats = async (req, res) => {
       (campaignMessageIds || []).map(m => `${m.whatsapp_number_id}_${m.user_phone}`)
     );
 
-    // Count incoming messages from those users
+    // Count unique users who replied (not total reply messages)
     const { data: incomingMessages } = await supabase
       .from('messages')
       .select('user_phone, whatsapp_number_id')
       .eq('direction', 'incoming');
 
-    const repliedCount = (incomingMessages || []).filter(m =>
-      campaignUsers.has(`${m.whatsapp_number_id}_${m.user_phone}`)
-    ).length;
+    // Get unique phone numbers who replied at least once
+    const uniqueRepliers = new Set();
+    (incomingMessages || []).forEach(m => {
+      if (campaignUsers.has(`${m.whatsapp_number_id}_${m.user_phone}`)) {
+        uniqueRepliers.add(`${m.whatsapp_number_id}_${m.user_phone}`);
+      }
+    });
+    const repliedCount = uniqueRepliers.size;
 
-    // Calculate percentages (based on total messages sent)
-    const calculatePercentage = (count) => {
-      if (totalMessages === 0) return 0;
-      return Math.round((count / totalMessages) * 100);
-    };
+    // Calculate percentages correctly:
+    // - Sent %: based on total_contacts
+    // - Delivered %: based on sent
+    // - Read %: based on delivered
+    // - Replied %: based on read (unique users who replied)
+    // - Failed %: based on total_contacts
+
+    const totalContacts = campaigns.reduce((sum, c) => sum + (c.total_contacts || 0), 0);
+
+    const sentPercentage = totalContacts > 0 ? Math.round((sentCount / totalContacts) * 100) : 0;
+    const deliveredPercentage = sentCount > 0 ? Math.round((deliveredCount / sentCount) * 100) : 0;
+    const readPercentage = deliveredCount > 0 ? Math.round((readCount / deliveredCount) * 100) : 0;
+    const repliedPercentage = readCount > 0 ? Math.round((repliedCount / readCount) * 100) : 0;
+    const failedPercentage = totalContacts > 0 ? Math.round((failedCount / totalContacts) * 100) : 0;
 
     const stats = {
       // Campaign-level stats
@@ -379,31 +393,31 @@ exports.getCampaignStats = async (req, res) => {
       completed: campaigns.filter(c => c.status === 'completed').length,
       paused: campaigns.filter(c => c.status === 'paused').length,
       failed: campaigns.filter(c => c.status === 'failed').length,
-      total_contacts: campaigns.reduce((sum, c) => sum + (c.total_contacts || 0), 0),
+      total_contacts: totalContacts,
       total_sent: totalMessages,
       total_failed: campaigns.reduce((sum, c) => sum + (c.total_failed || 0), 0),
 
-      // Message-level stats with percentages
+      // Message-level stats with correct percentages
       message_stats: {
         sent: {
           count: sentCount,
-          percentage: calculatePercentage(sentCount)
+          percentage: sentPercentage
         },
         delivered: {
           count: deliveredCount,
-          percentage: calculatePercentage(deliveredCount)
+          percentage: deliveredPercentage
         },
         read: {
           count: readCount,
-          percentage: calculatePercentage(readCount)
+          percentage: readPercentage
         },
         replied: {
           count: repliedCount,
-          percentage: calculatePercentage(repliedCount)
+          percentage: repliedPercentage
         },
         failed: {
           count: failedCount,
-          percentage: calculatePercentage(failedCount)
+          percentage: failedPercentage
         }
       }
     };

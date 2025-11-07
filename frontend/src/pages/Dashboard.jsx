@@ -1,12 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { useAuth } from '../contexts/AuthContext';
 import { useNavigate } from 'react-router-dom';
 import api from '../services/api';
 import { supabase } from '../config/supabase';
-import NotificationBell from '../components/NotificationBell';
 
 const Dashboard = () => {
-  const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [stats, setStats] = useState({
     whatsappNumbers: 0,
@@ -78,42 +75,8 @@ const Dashboard = () => {
     };
   };
 
-  const handleLogout = async () => {
-    await logout();
-    navigate('/login');
-  };
-
   return (
-    <div className="min-h-screen bg-gray-50">
-      {/* Header */}
-      <header className="bg-white shadow">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
-          <div className="flex justify-between items-center">
-            <div>
-              <h1 className="text-2xl font-bold text-gray-900">
-                WhatsApp Cloud API Platform
-              </h1>
-              <p className="text-sm text-gray-600 mt-1">
-                Welcome, {user?.email}
-              </p>
-            </div>
-            <div className="flex items-center space-x-4">
-              {/* Notifications Bell */}
-              <NotificationBell />
-
-              <button
-                onClick={handleLogout}
-                className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
-              >
-                Logout
-              </button>
-            </div>
-          </div>
-        </div>
-      </header>
-
-      {/* Main Content */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {/* Stats Overview */}
         <div className="mb-8">
           <h2 className="text-xl font-semibold text-gray-900 mb-4">
@@ -330,7 +293,6 @@ const Dashboard = () => {
             </button>
           </div>
         </div>
-      </main>
     </div>
   );
 };

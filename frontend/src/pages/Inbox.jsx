@@ -10,7 +10,11 @@ const Inbox = () => {
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(true);
   const [messagesLoading, setMessagesLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [stats, setStats] = useState({});
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const [messageOffset, setMessageOffset] = useState(0);
+  const MESSAGE_LIMIT = 50; // Load 50 messages at a time
 
   // Filters
   const [whatsappNumbers, setWhatsappNumbers] = useState([]);
@@ -66,20 +70,47 @@ const Inbox = () => {
     }
   };
 
-  const fetchConversationMessages = async (conversation) => {
+  const fetchConversationMessages = async (conversation, offset = 0, append = false) => {
     try {
-      setMessagesLoading(true);
-      setSelectedConversation(conversation);
+      if (!append) {
+        setMessagesLoading(true);
+        setSelectedConversation(conversation);
+        setMessageOffset(0);
+      } else {
+        setLoadingMore(true);
+      }
 
       const res = await api.get(
-        `/messages/conversations/${conversation.whatsapp_number_id}/${conversation.user_phone}`
+        `/messages/conversations/${conversation.whatsapp_number_id}/${conversation.user_phone}?limit=${MESSAGE_LIMIT}&offset=${offset}`
       );
-      setMessages(res.data?.data?.messages || []);
+
+      const newMessages = res.data?.data?.messages || [];
+
+      if (append) {
+        // Prepend older messages to the top
+        setMessages(prev => [...newMessages, ...prev]);
+      } else {
+        // Replace messages (initial load)
+        setMessages(newMessages);
+      }
+
+      // Check if there are more messages to load
+      setHasMoreMessages(newMessages.length === MESSAGE_LIMIT);
+
     } catch (error) {
       console.error('Error fetching messages:', error);
     } finally {
       setMessagesLoading(false);
+      setLoadingMore(false);
     }
+  };
+
+  const loadMoreMessages = () => {
+    if (!selectedConversation || loadingMore || !hasMoreMessages) return;
+
+    const newOffset = messageOffset + MESSAGE_LIMIT;
+    setMessageOffset(newOffset);
+    fetchConversationMessages(selectedConversation, newOffset, true);
   };
 
   const setupRealtimeSubscriptions = () => {
@@ -127,23 +158,14 @@ const Inbox = () => {
   };
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      {/* Header */}
-      <header className="bg-white shadow">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
-          <div className="flex justify-between items-center">
-            <div>
-              <h1 className="text-2xl font-bold text-gray-900">Inbox</h1>
-              <p className="text-sm text-gray-600 mt-1">
-                {stats.total_conversations || 0} conversations • {stats.total_messages || 0} messages
-              </p>
-            </div>
-          </div>
-        </div>
-      </header>
-
-      {/* Main Content */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+      {/* Page Title */}
+      <div className="mb-6">
+        <h1 className="text-2xl font-bold text-gray-900">Inbox</h1>
+        <p className="text-sm text-gray-600 mt-1">
+          {stats.total_conversations || 0} conversations • {stats.total_messages || 0} messages
+        </p>
+      </div>
         {/* Filters */}
         <div className="bg-white shadow rounded-lg p-4 mb-6">
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -322,6 +344,30 @@ const Inbox = () => {
                     <div className="text-center text-gray-500">No messages</div>
                   ) : (
                     <div className="space-y-4">
+                      {/* Load More Button at Top */}
+                      {hasMoreMessages && (
+                        <div className="text-center pb-4">
+                          <button
+                            onClick={loadMoreMessages}
+                            disabled={loadingMore}
+                            className="px-4 py-2 bg-white border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                          >
+                            {loadingMore ? (
+                              <span className="flex items-center gap-2">
+                                <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                </svg>
+                                Loading...
+                              </span>
+                            ) : (
+                              'Load More Messages'
+                            )}
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Messages */}
                       {messages.map((msg) => (
                         <div
                           key={msg.id}
@@ -368,7 +414,6 @@ const Inbox = () => {
             )}
           </div>
         </div>
-      </main>
     </div>
   );
 };
