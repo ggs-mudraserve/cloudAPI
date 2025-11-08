@@ -373,16 +373,16 @@ exports.getCampaignStats = async (req, res) => {
     // Calculate percentages correctly:
     // - Sent %: based on total_contacts
     // - Delivered %: based on sent
-    // - Read %: based on delivered
-    // - Replied %: based on read (unique users who replied)
+    // - Read %: based on sent
+    // - Replied %: based on sent (unique users who replied)
     // - Failed %: based on total_contacts
 
     const totalContacts = campaigns.reduce((sum, c) => sum + (c.total_contacts || 0), 0);
 
     const sentPercentage = totalContacts > 0 ? Math.round((sentCount / totalContacts) * 100) : 0;
     const deliveredPercentage = sentCount > 0 ? Math.round((deliveredCount / sentCount) * 100) : 0;
-    const readPercentage = deliveredCount > 0 ? Math.round((readCount / deliveredCount) * 100) : 0;
-    const repliedPercentage = readCount > 0 ? Math.round((repliedCount / readCount) * 100) : 0;
+    const readPercentage = sentCount > 0 ? Math.round((readCount / sentCount) * 100) : 0;
+    const repliedPercentage = sentCount > 0 ? Math.round((repliedCount / sentCount) * 100) : 0;
     const failedPercentage = totalContacts > 0 ? Math.round((failedCount / totalContacts) * 100) : 0;
 
     const stats = {
