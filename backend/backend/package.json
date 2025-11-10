@@ -7,9 +7,6 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "cron": "node cron.js",
-    "monitor": "node monitor-campaign.js",
-    "list-campaigns": "node list-campaigns.js",
-    "fix-counters": "node fix-campaign-counters.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [

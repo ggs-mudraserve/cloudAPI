@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { login, logout, verifySession, refreshToken } = require('../controllers/authController');
+const { login, logout, verifySession } = require('../controllers/authController');
 const { validateJWT } = require('../middleware/auth');
 
 /**
@@ -23,12 +23,5 @@ router.post('/logout', validateJWT, logout);
  * @access  Private (requires valid JWT)
  */
 router.get('/verify', validateJWT, verifySession);
-
-/**
- * @route   POST /api/auth/refresh
- * @desc    Refresh access token using refresh token
- * @access  Public (uses refresh token for authentication)
- */
-router.post('/refresh', refreshToken);
 
 module.exports = router;

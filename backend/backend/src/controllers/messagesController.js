@@ -3,104 +3,127 @@ const { supabase } = require('../config/supabase');
 /**
  * Get all conversations grouped by user_phone
  * Returns list of conversations with last message and reply count
- * OPTIMIZED: Uses pagination and efficient aggregation queries
  *
  * Query params:
  * - whatsapp_number_id: Filter by WhatsApp number (optional)
  * - search: Search in user_phone or message_body (optional)
- * - limit: Max conversations to return (default: 50)
- * - offset: Pagination offset (default: 0)
+ * - start_date: Filter from date (optional, ISO format)
+ * - end_date: Filter to date (optional, ISO format)
  */
 exports.getConversations = async (req, res) => {
   try {
     const {
       whatsapp_number_id,
       search,
-      limit = 50,
-      offset = 0
+      start_date,
+      end_date
     } = req.query;
 
-    // Use optimized SQL query with aggregation
-    let rpcParams = {
-      p_limit: parseInt(limit),
-      p_offset: parseInt(offset)
-    };
+    // Build base query for distinct user_phone numbers
+    let query = supabase
+      .from('messages')
+      .select('user_phone, whatsapp_number_id')
+      .order('created_at', { ascending: false });
 
+    // Apply filters
     if (whatsapp_number_id) {
-      rpcParams.p_whatsapp_number_id = whatsapp_number_id;
+      query = query.eq('whatsapp_number_id', whatsapp_number_id);
+    }
+
+    if (start_date) {
+      query = query.gte('created_at', start_date);
+    }
+
+    if (end_date) {
+      query = query.lte('created_at', end_date);
     }
 
     if (search) {
-      rpcParams.p_search = search;
+      query = query.or(`user_phone.ilike.%${search}%,message_body.ilike.%${search}%`);
     }
 
-    // Use fallback query directly (optimized RPC function can be added later)
-    console.log('[Messages] Using fallback query');
-    const fallbackResult = await getFallbackConversations(whatsapp_number_id, search, limit, offset);
+    const { data: messages, error: messagesError } = await query;
 
-    if (fallbackResult.error) {
-      throw fallbackResult.error;
-    }
+    if (messagesError) throw messagesError;
 
-    const conversations = fallbackResult.data;
-
-    // Fetch WhatsApp numbers in bulk
-    const whatsappNumberIds = [...new Set(conversations.map(c => c.whatsapp_number_id))];
-    const { data: whatsappNumbers } = await supabase
-      .from('whatsapp_numbers')
-      .select('id, display_name, number')
-      .in('id', whatsappNumberIds);
-
-    const whatsappNumberMap = {};
-    (whatsappNumbers || []).forEach(wn => {
-      whatsappNumberMap[wn.id] = wn;
+    // Group by user_phone and get unique conversations
+    const uniqueConversations = {};
+    messages.forEach(msg => {
+      const key = `${msg.whatsapp_number_id}_${msg.user_phone}`;
+      if (!uniqueConversations[key]) {
+        uniqueConversations[key] = {
+          user_phone: msg.user_phone,
+          whatsapp_number_id: msg.whatsapp_number_id
+        };
+      }
     });
 
-    // Fetch reply limits in bulk
-    const userPhones = conversations.map(c => c.user_phone);
-    const { data: replyLimits } = await supabase
-      .from('user_reply_limits')
-      .select('user_phone, reply_count, last_reply_at')
-      .in('user_phone', userPhones);
+    // For each conversation, get last message and counts
+    const conversations = await Promise.all(
+      Object.values(uniqueConversations).map(async (conv) => {
+        // Get last message
+        const { data: lastMessage } = await supabase
+          .from('messages')
+          .select('*')
+          .eq('whatsapp_number_id', conv.whatsapp_number_id)
+          .eq('user_phone', conv.user_phone)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single();
 
-    const replyLimitMap = {};
-    (replyLimits || []).forEach(rl => {
-      replyLimitMap[rl.user_phone] = rl;
-    });
+        // Get message counts
+        const { data: counts } = await supabase
+          .from('messages')
+          .select('id', { count: 'exact', head: false })
+          .eq('whatsapp_number_id', conv.whatsapp_number_id)
+          .eq('user_phone', conv.user_phone);
 
-    // Enrich conversations with data
-    const enrichedConversations = conversations.map(conv => {
-      const whatsappNumber = whatsappNumberMap[conv.whatsapp_number_id];
-      const replyLimit = replyLimitMap[conv.user_phone];
+        // Get unread count (incoming messages without corresponding outgoing)
+        const { data: unreadMessages } = await supabase
+          .from('messages')
+          .select('id', { count: 'exact', head: false })
+          .eq('whatsapp_number_id', conv.whatsapp_number_id)
+          .eq('user_phone', conv.user_phone)
+          .eq('direction', 'incoming');
 
-      return {
-        user_phone: conv.user_phone,
-        whatsapp_number_id: conv.whatsapp_number_id,
-        whatsapp_number_display: whatsappNumber?.display_name || whatsappNumber?.number,
-        last_message: {
-          id: conv.id,
-          message_body: conv.message_body,
-          message_type: conv.message_type,
-          direction: conv.direction,
-          created_at: conv.created_at,
-          status: conv.status
-        },
-        total_messages: conv.total_messages || 1,
-        unread_count: conv.unread_count || 0,
-        reply_count: replyLimit?.reply_count || 0,
-        reply_limit_reached: (replyLimit?.reply_count || 0) >= 40,
-        last_reply_at: replyLimit?.last_reply_at
-      };
+        // Get reply limit info
+        const { data: replyLimit } = await supabase
+          .from('user_reply_limits')
+          .select('reply_count, last_reply_at')
+          .eq('user_phone', conv.user_phone)
+          .maybeSingle();
+
+        // Get WhatsApp number details
+        const { data: whatsappNumber } = await supabase
+          .from('whatsapp_numbers')
+          .select('display_name, number')
+          .eq('id', conv.whatsapp_number_id)
+          .single();
+
+        return {
+          user_phone: conv.user_phone,
+          whatsapp_number_id: conv.whatsapp_number_id,
+          whatsapp_number_display: whatsappNumber?.display_name || whatsappNumber?.number,
+          last_message: lastMessage,
+          total_messages: counts?.length || 0,
+          unread_count: unreadMessages?.length || 0,
+          reply_count: replyLimit?.reply_count || 0,
+          reply_limit_reached: (replyLimit?.reply_count || 0) >= 40,
+          last_reply_at: replyLimit?.last_reply_at
+        };
+      })
+    );
+
+    // Sort by last message time
+    conversations.sort((a, b) => {
+      const timeA = new Date(a.last_message?.created_at || 0);
+      const timeB = new Date(b.last_message?.created_at || 0);
+      return timeB - timeA;
     });
 
     res.json({
       success: true,
-      data: enrichedConversations,
-      pagination: {
-        limit: parseInt(limit),
-        offset: parseInt(offset),
-        has_more: enrichedConversations.length === parseInt(limit)
-      }
+      data: conversations
     });
 
   } catch (error) {
@@ -111,56 +134,6 @@ exports.getConversations = async (req, res) => {
     });
   }
 };
-
-/**
- * Fallback function for conversations when optimized query fails
- */
-async function getFallbackConversations(whatsappNumberId, search, limit, offset) {
-  let query = supabase
-    .from('messages')
-    .select('*')
-    .order('created_at', { ascending: false })
-    .limit(parseInt(limit) * 10); // Get more to account for duplicates
-
-  if (whatsappNumberId) {
-    query = query.eq('whatsapp_number_id', whatsappNumberId);
-  }
-
-  if (search) {
-    query = query.ilike('user_phone', `%${search}%`);
-  }
-
-  const { data: messages, error } = await query;
-
-  if (error) {
-    throw error;
-  }
-
-  // Group by conversation
-  const conversationMap = {};
-  messages.forEach(msg => {
-    const key = `${msg.whatsapp_number_id}_${msg.user_phone}`;
-    if (!conversationMap[key]) {
-      conversationMap[key] = {
-        ...msg,
-        total_messages: 1,
-        unread_count: msg.direction === 'incoming' ? 1 : 0
-      };
-    } else {
-      conversationMap[key].total_messages++;
-      if (msg.direction === 'incoming') {
-        conversationMap[key].unread_count++;
-      }
-    }
-  });
-
-  // Sort conversations by latest message timestamp (descending)
-  const conversations = Object.values(conversationMap)
-    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-    .slice(parseInt(offset), parseInt(offset) + parseInt(limit));
-
-  return { data: conversations, error: null };
-}
 
 /**
  * Get all messages for a specific conversation

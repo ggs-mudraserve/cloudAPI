@@ -96,7 +96,7 @@ async function startServer() {
 
       // Start queue processor
       console.log('🔄 Starting queue processor...');
-      startQueueProcessor(100); // Process every 100ms for faster throughput
+      startQueueProcessor(5000); // Process every 5 seconds
       console.log('✅ Queue processor started');
     });
   } catch (error) {

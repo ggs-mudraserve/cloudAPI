@@ -117,13 +117,18 @@ function getRetryDelay(retryCount) {
 /**
  * Process a single message from the queue
  */
-async function processMessage(message, whatsappNumber, rateState, templateMap) {
+async function processMessage(message, whatsappNumber, rateState) {
   try {
-    // Get template from cache
-    const template = templateMap ? templateMap[message.template_name] : null;
+    // Get template components
+    const { data: template, error: templateError } = await supabase
+      .from('templates')
+      .select('components, language')
+      .eq('whatsapp_number_id', message.whatsapp_number_id)
+      .eq('name', message.template_name)
+      .single();
 
-    if (!template) {
-      throw new Error(`Template ${message.template_name} not found in cache`);
+    if (templateError || !template) {
+      throw new Error(`Template ${message.template_name} not found`);
     }
 
     // Update status to processing
@@ -251,9 +256,6 @@ async function processMessage(message, whatsappNumber, rateState, templateMap) {
   }
 }
 
-// Template cache per campaign
-const templateCache = new Map();
-
 /**
  * Process queue for a specific campaign
  */
@@ -262,7 +264,7 @@ async function processCampaignQueue(campaignId) {
     // Get campaign details
     const { data: campaign, error: campaignError } = await supabase
       .from('campaigns')
-      .select('id, whatsapp_number_id, status, total_contacts, template_names')
+      .select('id, whatsapp_number_id, status, total_contacts')
       .eq('id', campaignId)
       .single();
 
@@ -277,7 +279,7 @@ async function processCampaignQueue(campaignId) {
     }
 
     // Get WhatsApp number details
-    const { data: whatsappNumber, error: numberError} = await supabase
+    const { data: whatsappNumber, error: numberError } = await supabase
       .from('whatsapp_numbers')
       .select('id, phone_number_id, access_token, max_send_rate_per_sec, is_active')
       .eq('id', campaign.whatsapp_number_id)
@@ -298,25 +300,6 @@ async function processCampaignQueue(campaignId) {
       return;
     }
 
-    // Pre-fetch templates for this campaign (cache them)
-    const cacheKey = `${campaign.whatsapp_number_id}_templates`;
-    if (!templateCache.has(cacheKey)) {
-      const { data: templates, error: templateError } = await supabase
-        .from('templates')
-        .select('name, components, language')
-        .eq('whatsapp_number_id', campaign.whatsapp_number_id)
-        .in('name', campaign.template_names);
-
-      if (!templateError && templates) {
-        const templateMap = {};
-        templates.forEach(t => {
-          templateMap[t.name] = { components: t.components, language: t.language };
-        });
-        templateCache.set(cacheKey, templateMap);
-        console.log(`[Queue] Cached ${templates.length} template(s) for campaign ${campaignId}`);
-      }
-    }
-
     // Initialize rate control
     const rateState = initRateControl(
       whatsappNumber.id,
@@ -325,7 +308,8 @@ async function processCampaignQueue(campaignId) {
 
     // Check if already processing
     if (rateState.isProcessing) {
-      return; // Silently skip, don't log spam
+      console.log(`[Queue] Campaign ${campaignId} is already being processed`);
+      return;
     }
 
     rateState.isProcessing = true;
@@ -386,25 +370,15 @@ async function processCampaignQueue(campaignId) {
 
     console.log(`[Queue] Processing ${messages.length} messages for campaign ${campaignId} at ${rateState.currentRate} msg/sec`);
 
-    // Get template map from cache (reuse cacheKey from above)
-    const templateMap = templateCache.get(`${campaign.whatsapp_number_id}_templates`);
-
-    // Process messages with rate limiting - PARALLEL PROCESSING
+    // Process messages with rate limiting
     const delay = getDelay(rateState.currentRate);
-    const promises = [];
 
     for (const message of messages) {
-      // Fire off message processing (don't await - run in parallel)
-      promises.push(processMessage(message, whatsappNumber, rateState, templateMap));
+      await processMessage(message, whatsappNumber, rateState);
 
-      // Rate limiting delay - wait before starting NEXT message
-      if (promises.length < messages.length) {
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
+      // Rate limiting delay
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
-
-    // Wait for all messages to complete
-    await Promise.allSettled(promises);
 
     rateState.isProcessing = false;
 
@@ -511,55 +485,18 @@ async function processQueue() {
 }
 
 /**
- * Start queue processor with adaptive interval
- * Fast when campaigns are active, slower when idle
+ * Start queue processor with interval
  */
-function startQueueProcessor(fastInterval = 100, slowInterval = 5000) {
-  console.log('[Queue] Starting queue processor with adaptive interval...');
+function startQueueProcessor(intervalMs = 5000) {
+  console.log('[Queue] Starting queue processor...');
 
-  let currentInterval = slowInterval;
-  let intervalHandle = null;
-  let consecutiveEmptyPolls = 0;
+  // Process immediately
+  processQueue();
 
-  async function adaptiveProcessQueue() {
-    // Get count of running campaigns
-    const { count: runningCount } = await supabase
-      .from('campaigns')
-      .select('*', { count: 'exact', head: true })
-      .eq('status', 'running');
+  // Then process at regular intervals
+  const interval = setInterval(processQueue, intervalMs);
 
-    // Adjust interval based on activity
-    if (runningCount > 0) {
-      // Active campaigns - use fast interval
-      if (currentInterval !== fastInterval) {
-        console.log(`[Queue] Switching to fast interval (${fastInterval}ms) - ${runningCount} active campaign(s)`);
-        currentInterval = fastInterval;
-        clearInterval(intervalHandle);
-        intervalHandle = setInterval(adaptiveProcessQueue, fastInterval);
-      }
-      consecutiveEmptyPolls = 0;
-    } else {
-      // No active campaigns - use slow interval
-      consecutiveEmptyPolls++;
-      if (consecutiveEmptyPolls >= 3 && currentInterval !== slowInterval) {
-        console.log(`[Queue] Switching to slow interval (${slowInterval}ms) - no active campaigns`);
-        currentInterval = slowInterval;
-        clearInterval(intervalHandle);
-        intervalHandle = setInterval(adaptiveProcessQueue, slowInterval);
-      }
-    }
-
-    // Process the queue
-    await processQueue();
-  }
-
-  // Start with first poll
-  adaptiveProcessQueue();
-
-  // Set initial interval (slow by default)
-  intervalHandle = setInterval(adaptiveProcessQueue, slowInterval);
-
-  return intervalHandle;
+  return interval;
 }
 
 module.exports = {

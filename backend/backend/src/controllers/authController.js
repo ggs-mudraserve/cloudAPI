@@ -125,61 +125,8 @@ async function verifySession(req, res) {
   }
 }
 
-/**
- * Refresh access token using refresh token
- */
-async function refreshToken(req, res) {
-  try {
-    const { refresh_token } = req.body;
-
-    if (!refresh_token) {
-      return res.status(400).json({
-        error: 'Bad Request',
-        message: 'Refresh token is required'
-      });
-    }
-
-    // Refresh the session with Supabase
-    const { data, error } = await supabase.auth.refreshSession({
-      refresh_token
-    });
-
-    if (error || !data.session) {
-      console.error('Token refresh error:', error?.message);
-      return res.status(401).json({
-        error: 'Unauthorized',
-        message: 'Invalid or expired refresh token'
-      });
-    }
-
-    // Return new session data
-    res.json({
-      success: true,
-      user: {
-        id: data.user.id,
-        email: data.user.email,
-        role: data.user.role
-      },
-      session: {
-        access_token: data.session.access_token,
-        refresh_token: data.session.refresh_token,
-        expires_at: data.session.expires_at,
-        expires_in: data.session.expires_in
-      }
-    });
-
-  } catch (error) {
-    console.error('Token refresh exception:', error);
-    res.status(500).json({
-      error: 'Internal Server Error',
-      message: 'Token refresh failed'
-    });
-  }
-}
-
 module.exports = {
   login,
   logout,
-  verifySession,
-  refreshToken
+  verifySession
 };
