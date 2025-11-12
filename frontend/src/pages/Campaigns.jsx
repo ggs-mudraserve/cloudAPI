@@ -742,13 +742,16 @@ const Campaigns = () => {
                           Sent
                         </th>
                         <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Delivered
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Read
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                          Replied
+                        </th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                           Failed
-                        </th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                          Ready
-                        </th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                          Processing
                         </th>
                       </tr>
                     </thead>
@@ -764,14 +767,17 @@ const Campaigns = () => {
                           <td className="px-6 py-4 whitespace-nowrap text-sm text-green-600">
                             {stats.sent}
                           </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-blue-600">
+                            {stats.delivered}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-indigo-600">
+                            {stats.read}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-purple-600">
+                            {stats.replied}
+                          </td>
                           <td className="px-6 py-4 whitespace-nowrap text-sm text-red-600">
                             {stats.failed}
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-blue-600">
-                            {stats.ready}
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-yellow-600">
-                            {stats.processing}
                           </td>
                         </tr>
                       ))}

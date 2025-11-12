@@ -126,6 +126,8 @@ async function createCampaign(campaignData, csvBuffer) {
     const invalidContactsCount = invalidContacts.length;
 
     // Start transaction
+    // CRITICAL FIX: Create campaign with 'paused' status first to avoid race condition
+    // Only set to 'running' AFTER queue is populated
     const { data: campaign, error: campaignError } = await supabase
       .from('campaigns')
       .insert({
@@ -136,7 +138,7 @@ async function createCampaign(campaignData, csvBuffer) {
         invalid_contacts_count: invalidContactsCount,
         scheduled_start_time: campaignData.scheduled_start_time,
         is_scheduled: campaignData.is_scheduled || false,
-        status: campaignData.is_scheduled ? 'scheduled' : 'running'
+        status: campaignData.is_scheduled ? 'scheduled' : 'paused' // Use 'paused' temporarily
       })
       .select()
       .single();
@@ -190,6 +192,27 @@ async function createCampaign(campaignData, csvBuffer) {
     // If not scheduled, enqueue valid messages immediately
     if (!campaignData.is_scheduled) {
       await enqueueMessages(campaign.id, campaign.whatsapp_number_id, distribution, {});
+
+      // CRITICAL FIX: Only mark campaign as 'running' AFTER queue is fully populated
+      // This prevents race condition where queue processor sees running campaign with 0 messages
+      const { error: updateError } = await supabase
+        .from('campaigns')
+        .update({
+          status: 'running',
+          start_time: new Date().toISOString()
+        })
+        .eq('id', campaign.id);
+
+      if (updateError) {
+        console.error('Error updating campaign status to running:', updateError);
+        throw updateError;
+      }
+
+      console.log(`[Campaign] Campaign ${campaign.id} marked as running after queue populated`);
+
+      // Update campaign object to reflect new status
+      campaign.status = 'running';
+      campaign.start_time = new Date().toISOString();
     }
 
     return {
@@ -374,39 +397,189 @@ async function getCampaign(campaignId) {
     }
   });
 
-  // Get send statistics per template from send_queue
-  const { data: queueStats, error: queueError } = await supabase
-    .from('send_queue')
-    .select('template_name, status')
-    .eq('campaign_id', campaignId);
+  // Get send statistics per template from send_queue with pagination
+  let queueStats = [];
+  let fromQueue = 0;
+  const batchSize = 1000;
+  let hasMoreQueue = true;
 
-  if (queueError) throw queueError;
+  while (hasMoreQueue) {
+    const { data: batch, error: queueError } = await supabase
+      .from('send_queue')
+      .select('template_name, status, phone')
+      .eq('campaign_id', campaignId)
+      .range(fromQueue, fromQueue + batchSize - 1);
 
-  // Calculate send stats per template
+    if (queueError) throw queueError;
+
+    if (batch && batch.length > 0) {
+      queueStats = queueStats.concat(batch);
+      fromQueue += batchSize;
+      hasMoreQueue = batch.length === batchSize;
+    } else {
+      hasMoreQueue = false;
+    }
+  }
+
+  // Get message status logs for this campaign with pagination
+  let statusLogs = [];
+  let fromStatus = 0;
+  let hasMoreStatus = true;
+
+  while (hasMoreStatus) {
+    const { data: batch, error: statusError } = await supabase
+      .from('message_status_logs')
+      .select('whatsapp_message_id, status, created_at')
+      .eq('campaign_id', campaignId)
+      .range(fromStatus, fromStatus + batchSize - 1);
+
+    if (statusError) throw statusError;
+
+    if (batch && batch.length > 0) {
+      statusLogs = statusLogs.concat(batch);
+      fromStatus += batchSize;
+      hasMoreStatus = batch.length === batchSize;
+    } else {
+      hasMoreStatus = false;
+    }
+  }
+
+  // Get latest status for each message
+  const messageLatestStatus = new Map();
+  statusLogs.forEach(log => {
+    const existing = messageLatestStatus.get(log.whatsapp_message_id);
+    if (!existing || new Date(log.created_at) > new Date(existing.created_at)) {
+      messageLatestStatus.set(log.whatsapp_message_id, log);
+    }
+  });
+
+  // Get campaign messages with template info
+  let campaignMessages = [];
+  let fromMessages = 0;
+  let hasMoreMessages = true;
+
+  while (hasMoreMessages) {
+    const { data: batch, error: messagesError } = await supabase
+      .from('messages')
+      .select('whatsapp_message_id, user_phone, whatsapp_number_id')
+      .eq('campaign_id', campaignId)
+      .eq('direction', 'outgoing')
+      .range(fromMessages, fromMessages + batchSize - 1);
+
+    if (messagesError) throw messagesError;
+
+    if (batch && batch.length > 0) {
+      campaignMessages = campaignMessages.concat(batch);
+      fromMessages += batchSize;
+      hasMoreMessages = batch.length === batchSize;
+    } else {
+      hasMoreMessages = false;
+    }
+  }
+
+  // Create map of phone -> template from send_queue
+  const phoneToTemplate = new Map();
+  queueStats.forEach(item => {
+    if (item.template_name && item.phone) {
+      phoneToTemplate.set(item.phone, item.template_name);
+    }
+  });
+
+  // Get incoming messages (replies) with pagination
+  const campaignUsers = new Set(campaignMessages.map(m => `${m.whatsapp_number_id}_${m.user_phone}`));
+
+  let incomingMessages = [];
+  let fromIncoming = 0;
+  let hasMoreIncoming = true;
+
+  while (hasMoreIncoming) {
+    const { data: batch, error: incomingError } = await supabase
+      .from('messages')
+      .select('user_phone, whatsapp_number_id')
+      .eq('direction', 'incoming')
+      .range(fromIncoming, fromIncoming + batchSize - 1);
+
+    if (incomingError) throw incomingError;
+
+    if (batch && batch.length > 0) {
+      incomingMessages = incomingMessages.concat(batch);
+      fromIncoming += batchSize;
+      hasMoreIncoming = batch.length === batchSize;
+    } else {
+      hasMoreIncoming = false;
+    }
+  }
+
+  // Map replies to templates
+  const repliesByPhone = new Map();
+  incomingMessages.forEach(m => {
+    const key = `${m.whatsapp_number_id}_${m.user_phone}`;
+    if (campaignUsers.has(key)) {
+      repliesByPhone.set(m.user_phone, true);
+    }
+  });
+
+  // Calculate template stats
   const templateStats = {};
-  (queueStats || []).forEach(item => {
+
+  // Initialize stats from queue
+  queueStats.forEach(item => {
     if (!item.template_name) return;
 
     if (!templateStats[item.template_name]) {
       templateStats[item.template_name] = {
+        total: 0,
         sent: 0,
-        failed: 0,
-        ready: 0,
-        processing: 0,
-        total: 0
+        delivered: 0,
+        read: 0,
+        replied: 0,
+        failed: 0
       };
     }
 
     templateStats[item.template_name].total++;
+  });
 
-    if (item.status === 'sent') {
-      templateStats[item.template_name].sent++;
-    } else if (item.status === 'failed') {
-      templateStats[item.template_name].failed++;
-    } else if (item.status === 'ready') {
-      templateStats[item.template_name].ready++;
-    } else if (item.status === 'processing') {
-      templateStats[item.template_name].processing++;
+  // Add status counts from message_status_logs
+  campaignMessages.forEach(msg => {
+    const template = phoneToTemplate.get(msg.user_phone);
+    if (!template) return;
+
+    const latestStatus = messageLatestStatus.get(msg.whatsapp_message_id);
+    if (!latestStatus) return;
+
+    if (!templateStats[template]) {
+      templateStats[template] = {
+        total: 0,
+        sent: 0,
+        delivered: 0,
+        read: 0,
+        replied: 0,
+        failed: 0
+      };
+    }
+
+    // Count cumulative stats
+    if (latestStatus.status === 'failed') {
+      templateStats[template].failed++;
+    } else {
+      // Sent = all non-failed
+      templateStats[template].sent++;
+
+      // Delivered = delivered + read
+      if (latestStatus.status === 'delivered' || latestStatus.status === 'read') {
+        templateStats[template].delivered++;
+      }
+
+      // Read
+      if (latestStatus.status === 'read') {
+        templateStats[template].read++;
+      }
+    }
+
+    // Check if user replied
+    if (repliesByPhone.has(msg.user_phone)) {
+      templateStats[template].replied++;
     }
   });
 

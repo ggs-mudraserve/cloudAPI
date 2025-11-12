@@ -164,13 +164,18 @@ async function processMessage(message, whatsappNumber, rateState, templateMap) {
       }
 
       // Insert initial status log
-      await supabase
+      const { error: statusLogError } = await supabase
         .from('message_status_logs')
         .insert({
           whatsapp_message_id: result.messageId,
           status: 'sent',
           campaign_id: message.campaign_id
         });
+
+      if (statusLogError) {
+        console.error(`[Queue] Failed to insert status log for message ${result.messageId}:`, statusLogError.message);
+        // Continue anyway - message was sent successfully
+      }
 
       // Mark as sent in queue
       await supabase
@@ -283,10 +288,17 @@ async function processCampaignQueue(campaignId) {
       .eq('id', campaign.whatsapp_number_id)
       .single();
 
-    if (numberError || !whatsappNumber || !whatsappNumber.is_active) {
-      console.error(`[Queue] WhatsApp number not found or inactive for campaign ${campaignId}`);
+    if (numberError || !whatsappNumber) {
+      // FIXED: Don't fail campaign on transient database errors - just skip this cycle and retry
+      console.warn(`[Queue] Temporary error fetching WhatsApp number for campaign ${campaignId}:`, numberError?.message || 'Number not found');
+      console.log(`[Queue] Will retry on next poll cycle...`);
+      return;
+    }
 
-      // Mark campaign as failed
+    if (!whatsappNumber.is_active) {
+      console.error(`[Queue] WhatsApp number is inactive for campaign ${campaignId}`);
+
+      // Mark campaign as failed only if number is genuinely inactive
       await supabase
         .from('campaigns')
         .update({
