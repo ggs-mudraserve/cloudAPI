@@ -189,7 +189,7 @@ async function createCampaign(campaignData, csvBuffer) {
 
     // If not scheduled, enqueue valid messages immediately
     if (!campaignData.is_scheduled) {
-      await enqueueMessages(campaign.id, campaign.whatsapp_number_id, distribution);
+      await enqueueMessages(campaign.id, campaign.whatsapp_number_id, distribution, {});
     }
 
     return {
@@ -211,17 +211,83 @@ async function createCampaign(campaignData, csvBuffer) {
 /**
  * Enqueue messages for a campaign
  */
-async function enqueueMessages(campaignId, whatsappNumberId, distribution) {
+async function enqueueMessages(campaignId, whatsappNumberId, distribution, templateMediaUrls = {}) {
   const queueEntries = [];
 
+  // Fetch template components for all templates in this campaign
+  const templateNames = Object.keys(distribution);
+  const { data: templates, error: templateError } = await supabase
+    .from('templates')
+    .select('name, components')
+    .eq('whatsapp_number_id', whatsappNumberId)
+    .in('name', templateNames);
+
+  if (templateError) {
+    console.error('Error fetching templates for enqueueing:', templateError);
+    throw templateError;
+  }
+
+  // Create a map of template name -> template data
+  const templateMap = {};
+  templates.forEach(template => {
+    templateMap[template.name] = template;
+  });
+
   for (const [templateName, contacts] of Object.entries(distribution)) {
+    const template = templateMap[templateName];
+
+    // Check if template has a media header (VIDEO, IMAGE, or DOCUMENT)
+    const headerComponent = template?.components?.find(c => c.type === 'HEADER');
+    const hasMediaHeader = headerComponent &&
+      (headerComponent.format === 'VIDEO' || headerComponent.format === 'IMAGE' || headerComponent.format === 'DOCUMENT');
+
     for (const contact of contacts) {
+      let payload = contact.variables;
+
+      // If template has media header, check if CSV already provides media URL
+      if (hasMediaHeader) {
+        // Check if var1 from CSV is already a media URL
+        const csvHasMediaUrl = contact.variables.var1 &&
+          (String(contact.variables.var1).startsWith('http://') ||
+           String(contact.variables.var1).startsWith('https://'));
+
+        if (csvHasMediaUrl) {
+          // CSV already has media URL in var1, use it as-is (no shifting needed)
+          console.log(`[Campaign] Using media URL from CSV for template ${templateName}`);
+          payload = contact.variables;
+        } else {
+          // CSV doesn't have media URL, try to inject from templateMediaUrls or template example
+          let mediaUrl = templateMediaUrls[templateName];
+
+          // If no custom media URL provided, try to use template's example media URL
+          if (!mediaUrl && headerComponent.example?.header_handle?.[0]) {
+            mediaUrl = headerComponent.example.header_handle[0];
+          }
+
+          if (mediaUrl) {
+            // Prepend media URL as var1, shift other variables
+            payload = {
+              var1: mediaUrl,
+              ...Object.fromEntries(
+                Object.entries(contact.variables).map(([key, value]) => {
+                  const varNum = parseInt(key.replace('var', ''));
+                  return [`var${varNum + 1}`, value];
+                })
+              )
+            };
+            console.log(`[Campaign] Injected media URL from template example for ${templateName}`);
+          } else {
+            console.warn(`[Campaign] Template ${templateName} has media header but no media URL available (CSV, custom, or example)`);
+          }
+        }
+      }
+
       queueEntries.push({
         campaign_id: campaignId,
         whatsapp_number_id: whatsappNumberId,
         template_name: templateName,
         phone: contact.phone,
-        payload: contact.variables,
+        payload: payload,
         status: 'ready' // Ready to be processed
       });
     }

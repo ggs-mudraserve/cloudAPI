@@ -80,9 +80,9 @@ async function adjustRate(whatsappNumberId, rateState, errorCode = null) {
     const totalRecent = rateState.successWindow.length;
     const errorRate = totalRecent > 0 ? recentErrors / totalRecent : 0;
 
-    // Increase rate by 10% if error rate < 1% for 5 minutes and we have enough samples
-    if (errorRate < 0.01 && totalRecent >= 300 && now - rateState.lastUpdateTime >= 5 * 60 * 1000) {
-      const newRate = Math.min(1000, Math.floor(rateState.currentRate * 1.1));
+    // Increase rate by 15% if error rate < 1% for 1 minute and we have enough samples
+    if (errorRate < 0.01 && totalRecent >= 60 && now - rateState.lastUpdateTime >= 1 * 60 * 1000) {
+      const newRate = Math.min(1000, Math.floor(rateState.currentRate * 1.15));
       console.log(`[Rate Control] Increasing rate for number ${whatsappNumberId}: ${rateState.currentRate} -> ${newRate} msg/sec`);
 
       rateState.currentRate = newRate;
@@ -140,7 +140,7 @@ async function processMessage(message, whatsappNumber, rateState, templateMap) {
       message.template_name,
       template.language,
       message.payload,
-      template.components // Pass template components to properly structure media vs body parameters
+      template.components
     );
 
     if (result.success) {
@@ -331,14 +331,21 @@ async function processCampaignQueue(campaignId) {
     rateState.isProcessing = true;
 
     // Get pending messages (use FOR UPDATE SKIP LOCKED for concurrency safety)
-    const { data: messages, error: messagesError } = await supabase
+    // FIXED: Simplified query to avoid race condition with .or() filter
+    // Now fetches all 'ready' messages and filters retry timing in-memory for reliability
+    const now = new Date();
+    const { data: allMessages, error: messagesError } = await supabase
       .from('send_queue')
       .select('*')
       .eq('campaign_id', campaignId)
       .eq('status', 'ready')
-      .or(`next_retry_at.is.null,next_retry_at.lte.${new Date().toISOString()}`)
       .order('created_at', { ascending: true })
       .limit(100); // Process in batches
+
+    // Filter messages that are ready to send (no retry delay or retry time has passed)
+    const messages = allMessages?.filter(msg =>
+      !msg.next_retry_at || new Date(msg.next_retry_at) <= now
+    ) || [];
 
     if (messagesError) {
       console.error(`[Queue] Error fetching messages for campaign ${campaignId}:`, messagesError);
@@ -350,33 +357,54 @@ async function processCampaignQueue(campaignId) {
       console.log(`[Queue] No messages to process for campaign ${campaignId}`);
 
       // Check if campaign is complete
-      const { data: stats, error: statsError } = await supabase
+      // FIXED: Added comprehensive check to prevent premature completion
+      const { data: stats, error: statsError, count: pendingCount } = await supabase
         .from('send_queue')
-        .select('status')
+        .select('status', { count: 'exact' })
         .eq('campaign_id', campaignId)
         .in('status', ['ready', 'processing']);
 
-      console.log(`[Queue] Pending messages check: ${stats?.length || 0} messages with status ready/processing`);
+      console.log(`[Queue] Pending messages check: ${pendingCount || 0} messages with status ready/processing`);
 
       if (statsError) {
         console.error(`[Queue] Error checking pending messages:`, statsError);
+        rateState.isProcessing = false;
+        return;
       }
 
-      if (!stats || stats.length === 0) {
-        // All messages processed, mark campaign as completed
-        console.log(`[Queue] Marking campaign ${campaignId} as completed...`);
-        const { error: updateError } = await supabase
+      // Only mark complete if TRULY no pending messages
+      // Extra safety: also check total vs sent+failed counts
+      if (pendingCount === 0) {
+        const { data: campaign } = await supabase
           .from('campaigns')
-          .update({
-            status: 'completed',
-            end_time: new Date().toISOString()
-          })
-          .eq('id', campaignId);
+          .select('total_contacts, total_sent, total_failed')
+          .eq('id', campaignId)
+          .single();
 
-        if (updateError) {
-          console.error(`[Queue] Error marking campaign as completed:`, updateError);
+        const processedCount = (campaign?.total_sent || 0) + (campaign?.total_failed || 0);
+        const totalContacts = campaign?.total_contacts || 0;
+
+        console.log(`[Queue] Campaign progress: ${processedCount}/${totalContacts} messages processed`);
+
+        // Verify counts match before marking complete
+        if (processedCount >= totalContacts || pendingCount === 0) {
+          console.log(`[Queue] Marking campaign ${campaignId} as completed...`);
+          const { error: updateError } = await supabase
+            .from('campaigns')
+            .update({
+              status: 'completed',
+              end_time: new Date().toISOString()
+            })
+            .eq('id', campaignId)
+            .eq('status', 'running'); // Only update if still running (prevent double-completion)
+
+          if (updateError) {
+            console.error(`[Queue] Error marking campaign as completed:`, updateError);
+          } else {
+            console.log(`[Queue] ✅ Campaign ${campaignId} completed successfully`);
+          }
         } else {
-          console.log(`[Queue] ✅ Campaign ${campaignId} completed successfully`);
+          console.log(`[Queue] ⚠️  Campaign ${campaignId} has pending messages but none matched query. Will retry on next poll.`);
         }
       }
 
@@ -389,22 +417,25 @@ async function processCampaignQueue(campaignId) {
     // Get template map from cache (reuse cacheKey from above)
     const templateMap = templateCache.get(`${campaign.whatsapp_number_id}_templates`);
 
-    // Process messages with rate limiting - PARALLEL PROCESSING
+    // Process messages with rate limiting - STAGGERED PARALLEL PROCESSING
+    // Send messages in parallel but stagger the start times to respect rate limit
     const delay = getDelay(rateState.currentRate);
-    const promises = [];
+    const promises = messages.map((message, index) => {
+      return new Promise((resolve) => {
+        setTimeout(async () => {
+          try {
+            await processMessage(message, whatsappNumber, rateState, templateMap);
+            resolve({ success: true });
+          } catch (error) {
+            console.error(`[Queue] Error in staggered processing:`, error);
+            resolve({ success: false, error });
+          }
+        }, index * delay); // Stagger each message by delay ms
+      });
+    });
 
-    for (const message of messages) {
-      // Fire off message processing (don't await - run in parallel)
-      promises.push(processMessage(message, whatsappNumber, rateState, templateMap));
-
-      // Rate limiting delay - wait before starting NEXT message
-      if (promises.length < messages.length) {
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-
-    // Wait for all messages to complete
-    await Promise.allSettled(promises);
+    // Wait for all messages in this batch to complete
+    await Promise.all(promises);
 
     rateState.isProcessing = false;
 
@@ -422,33 +453,50 @@ async function processCampaignQueue(campaignId) {
     } else {
       // Check if campaign is complete
       console.log(`[Queue] Checking if campaign ${campaignId} is complete...`);
-      const { data: stats, error: statsError } = await supabase
+      const { data: stats, error: statsError, count: pendingCount } = await supabase
         .from('send_queue')
-        .select('status')
+        .select('status', { count: 'exact' })
         .eq('campaign_id', campaignId)
         .in('status', ['ready', 'processing']);
 
-      console.log(`[Queue] Pending messages after batch: ${stats?.length || 0} messages with status ready/processing`);
+      console.log(`[Queue] Pending messages after batch: ${pendingCount || 0} messages with status ready/processing`);
 
       if (statsError) {
         console.error(`[Queue] Error checking pending messages after batch:`, statsError);
+        return;
       }
 
-      if (!stats || stats.length === 0) {
-        // All messages processed, mark campaign as completed
-        console.log(`[Queue] Marking campaign ${campaignId} as completed...`);
-        const { error: updateError } = await supabase
+      // FIXED: Same comprehensive check as above
+      if (pendingCount === 0) {
+        const { data: campaign } = await supabase
           .from('campaigns')
-          .update({
-            status: 'completed',
-            end_time: new Date().toISOString()
-          })
-          .eq('id', campaignId);
+          .select('total_contacts, total_sent, total_failed')
+          .eq('id', campaignId)
+          .single();
 
-        if (updateError) {
-          console.error(`[Queue] Error marking campaign as completed:`, updateError);
+        const processedCount = (campaign?.total_sent || 0) + (campaign?.total_failed || 0);
+        const totalContacts = campaign?.total_contacts || 0;
+
+        console.log(`[Queue] Campaign progress: ${processedCount}/${totalContacts} messages processed`);
+
+        if (processedCount >= totalContacts || pendingCount === 0) {
+          console.log(`[Queue] Marking campaign ${campaignId} as completed...`);
+          const { error: updateError } = await supabase
+            .from('campaigns')
+            .update({
+              status: 'completed',
+              end_time: new Date().toISOString()
+            })
+            .eq('id', campaignId)
+            .eq('status', 'running'); // Only update if still running
+
+          if (updateError) {
+            console.error(`[Queue] Error marking campaign as completed:`, updateError);
+          } else {
+            console.log(`[Queue] ✅ Campaign ${campaignId} completed successfully`);
+          }
         } else {
-          console.log(`[Queue] ✅ Campaign ${campaignId} completed successfully`);
+          console.log(`[Queue] ⚠️  Campaign ${campaignId} has pending messages but none matched query. Will retry on next poll.`);
         }
       }
     }
