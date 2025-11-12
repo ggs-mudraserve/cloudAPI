@@ -83,7 +83,6 @@ async function sendTemplateMessage(phoneNumberId, accessToken, to, templateName,
     const hasMediaHeader = headerComponent &&
       (headerComponent.format === 'VIDEO' || headerComponent.format === 'IMAGE' || headerComponent.format === 'DOCUMENT');
 
-    // If template has media header, use var1 for header
     if (hasMediaHeader && variableValues.length > 0) {
       const mediaUrl = variableValues[currentVarIndex];
       currentVarIndex++;
@@ -129,6 +128,9 @@ async function sendTemplateMessage(phoneNumberId, accessToken, to, templateName,
         components: components.length > 0 ? components : undefined
       }
     };
+
+    // DEBUG: Log the payload being sent
+    console.log('[WhatsApp] Sending payload:', JSON.stringify(payload, null, 2));
 
     const response = await axios.post(
       `${WHATSAPP_API_BASE}/${cleanPhoneId}/messages`,

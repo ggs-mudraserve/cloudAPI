@@ -148,7 +148,7 @@ async function procesScheduledCampaigns() {
         });
 
         // Enqueue messages
-        await enqueueMessages(campaign.id, campaign.whatsapp_number_id, distribution);
+        await enqueueMessages(campaign.id, campaign.whatsapp_number_id, distribution, {});
 
         // Update campaign status to running
         await supabase

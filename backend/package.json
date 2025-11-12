@@ -10,6 +10,7 @@
     "monitor": "node monitor-campaign.js",
     "list-campaigns": "node list-campaigns.js",
     "fix-counters": "node fix-campaign-counters.js",
+    "test-speed": "node test-speed.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
@@ -33,6 +34,7 @@
     "multer": "^1.4.5-lts.1",
     "node-cron": "^3.0.3",
     "openai": "^4.24.1",
+    "pg": "^8.16.3",
     "uuid": "^9.0.1"
   },
   "devDependencies": {

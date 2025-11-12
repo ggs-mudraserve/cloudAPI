@@ -71,6 +71,33 @@
 
 ---
 
+### 5. Automatic Speed Optimization ⚡ NEW!
+**Feature:** Intelligent auto-scaling for message sending speed
+**How It Works:** System automatically finds optimal sending rate
+
+**Configuration:**
+- **Increase:** 15% every 1 minute (if no errors)
+- **Decrease:** 20% after 3 consecutive rate limit errors
+- **Range:** 10 msg/sec (min) to 1000 msg/sec (max)
+- **Auto-discovery:** Finds WhatsApp tier limit automatically
+
+**Timeline Example:**
+```
+Start:     60 msg/sec
+1 minute:  69 msg/sec
+2 minutes: 79 msg/sec
+5 minutes: 121 msg/sec
+8 minutes: 184 msg/sec
+10 minutes: 244 msg/sec (or stops at tier limit)
+```
+
+**Result:** No manual tuning needed - just run campaigns!
+
+**Files Modified:**
+- `src/services/queueProcessor.js` - Adaptive rate control logic (line 83-100)
+
+---
+
 ## Performance Improvements
 
 | Metric | Before | After | Improvement |

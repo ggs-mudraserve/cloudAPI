@@ -1,0 +1,59 @@
+#!/usr/bin/env node
+
+const {createClient} = require('@supabase/supabase-js');
+require('dotenv').config();
+const s = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+async function monitor() {
+  const { data: campaign } = await s
+    .from('campaigns')
+    .select('*')
+    .ilike('name', '%bajaj test1%')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .single();
+
+  if (!campaign) {
+    console.log('❌ Campaign not found');
+    return;
+  }
+
+  console.log('📊 Campaign:', campaign.name);
+  console.log('ID:', campaign.id);
+  console.log('Status:', campaign.status);
+  console.log('use_template_media:', campaign.use_template_media);
+  console.log('Total:', campaign.total_contacts);
+  console.log('Sent:', campaign.total_sent);
+  console.log('Failed:', campaign.total_failed);
+  console.log('Created:', campaign.created_at);
+
+  const { data: queue } = await s
+    .from('send_queue')
+    .select('status')
+    .eq('campaign_id', campaign.id);
+
+  const stats = {};
+  (queue || []).forEach(m => {
+    stats[m.status] = (stats[m.status] || 0) + 1;
+  });
+
+  console.log('\n📦 Queue Stats:', stats);
+
+  const { data: sample } = await s
+    .from('send_queue')
+    .select('payload, status, retry_count')
+    .eq('campaign_id', campaign.id)
+    .limit(3);
+
+  if (sample && sample.length > 0) {
+    console.log('\n📄 Sample Messages:');
+    sample.forEach((m, i) => {
+      console.log(`\nMessage ${i+1}:`);
+      console.log('Status:', m.status);
+      console.log('Retry:', m.retry_count);
+      console.log('Payload:', JSON.stringify(m.payload, null, 2));
+    });
+  }
+}
+
+monitor();
