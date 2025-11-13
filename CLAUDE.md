@@ -20,44 +20,33 @@ This is a **WhatsApp Cloud API Automation Platform** for large-scale template-ba
 
 This project has access to specialized MCP (Model Context Protocol) servers. **Always use these tools when applicable** - they provide critical project-specific capabilities.
 
-### Supabase MCP Server ⭐ (CRITICAL - USE FREQUENTLY)
+### Database Access (Self-Hosted Supabase)
 
-**When to use:**
-- **ALWAYS** before writing database queries or migrations
-- **ALWAYS** to verify table names, column names, and schema structure
-- **ALWAYS** when checking relationships between tables
-- When reading data from the database
-- When executing SQL queries
-- When applying database migrations
-- When checking project configuration
-- When listing tables, extensions, or migrations
+**Important:** This project uses a self-hosted Supabase instance on the same VPS. Access the database using:
 
-**Available Tools:**
-- `mcp__supabase__list_projects` - Find project ID
-- `mcp__supabase__get_project` - Get project details
-- `mcp__supabase__list_tables` - **Use this to verify table names before writing queries**
-- `mcp__supabase__execute_sql` - Run SELECT queries
-- `mcp__supabase__apply_migration` - Run DDL operations (CREATE, ALTER, etc.)
-- `mcp__supabase__list_migrations` - Check migration history
-- `mcp__supabase__get_advisors` - Check for security/performance issues
-
-**IMPORTANT WORKFLOW:**
-```
-1. FIRST: Use list_tables to verify exact table and column names
-2. THEN: Write your query/migration with correct names
-3. FINALLY: Execute using execute_sql or apply_migration
-```
-
-**Example:**
+**Method 1: Supabase Client (Preferred)**
 ```javascript
-// WRONG: Assuming table name
-await supabase.from('campaign_contact').select('*') // Typo! Table doesn't exist
-
-// RIGHT: Verify first
-// 1. Use mcp__supabase__list_tables to see: "campaign_contacts" (plural)
-// 2. Then write correct query
-await supabase.from('campaign_contacts').select('*') // Correct!
+const { supabase } = require('./src/config/supabase');
+const { data, error } = await supabase.from('table_name').select('*');
 ```
+
+**Method 2: Node.js Script**
+```bash
+node -e "
+const { supabase } = require('./src/config/supabase');
+(async () => {
+  const { data, error } = await supabase.from('table_name').select('*');
+  console.log(JSON.stringify(data, null, 2));
+  process.exit(0);
+})();
+"
+```
+
+**CRITICAL REMINDERS:**
+- ✅ Always verify table/column names with `database.md` documentation
+- ✅ Use exact spelling (plural/singular matters: `campaigns` not `campaign`)
+- ✅ Check foreign key relationships before queries
+- ✅ Use transactions for multi-step operations
 
 ### Context7 MCP Server (For Coding)
 
@@ -92,9 +81,10 @@ await supabase.from('campaign_contacts').select('*') // Correct!
 ## ⚠️ CRITICAL REMINDERS
 
 **Before ANY database operation:**
-1. ✅ Use `mcp__supabase__list_tables` to verify table names
-2. ✅ Cross-reference with `database.md` for schema details
-3. ✅ Use exact table/column names (spelling, plural/singular)
+1. ✅ Check `database.md` for exact table and column names
+2. ✅ Use exact spelling (plural/singular matters)
+3. ✅ Verify foreign key relationships
+4. ✅ Use Node.js scripts with Supabase client for database queries
 
 **Before implementing new features:**
 1. ✅ Use Context7 MCP to get latest library documentation
@@ -102,10 +92,11 @@ await supabase.from('campaign_contacts').select('*') // Correct!
 3. ✅ Avoid using outdated examples
 
 **Common mistakes to avoid:**
-- ❌ Assuming table names without verification
+- ❌ Assuming table names without checking database.md
 - ❌ Using singular when table is plural (campaign vs campaigns)
 - ❌ Forgetting underscores (campaign_contacts not campaigncontacts)
 - ❌ Using old library syntax without checking docs
+- ❌ Trying to use Supabase MCP (not available for self-hosted instances)
 
 ---
 

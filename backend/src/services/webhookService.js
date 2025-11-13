@@ -136,14 +136,40 @@ async function handleIncomingMessage(messageData, whatsappNumberId, whatsappNumb
       id: whatsappMessageId,
       timestamp,
       type,
-      text
+      text,
+      interactive,
+      button
     } = messageData;
+
+    // Log full message data for debugging
+    console.log(`[Webhook] Incoming message type: ${type}, from: ${from}`);
+    if (type !== 'text') {
+      console.log(`[Webhook] Full message data:`, JSON.stringify(messageData, null, 2));
+    }
 
     // Check idempotency
     const exists = await messageExists(whatsappMessageId);
     if (exists) {
       console.log(`[Webhook] Message ${whatsappMessageId} already exists, skipping`);
       return { success: true, duplicate: true };
+    }
+
+    // Extract message body based on type
+    let messageBody = '';
+    if (type === 'text') {
+      messageBody = text?.body || '';
+    } else if (type === 'interactive' && interactive?.type === 'button_reply') {
+      // For interactive button replies, use the button title as message body
+      messageBody = interactive.button_reply?.title || '';
+      console.log(`[Webhook] Interactive button reply: "${messageBody}"`);
+    } else if (type === 'interactive' && interactive?.type === 'list_reply') {
+      // For interactive list replies, use the list item title as message body
+      messageBody = interactive.list_reply?.title || '';
+      console.log(`[Webhook] Interactive list reply: "${messageBody}"`);
+    } else if (type === 'button' && button) {
+      // Some WhatsApp APIs send button clicks as type 'button'
+      messageBody = button.text || button.payload || '';
+      console.log(`[Webhook] Button message: "${messageBody}"`);
     }
 
     // Insert incoming message
@@ -154,7 +180,7 @@ async function handleIncomingMessage(messageData, whatsappNumberId, whatsappNumb
         user_phone: from,
         direction: 'incoming',
         message_type: type,
-        message_body: text?.body || '',
+        message_body: messageBody,
         whatsapp_message_id: whatsappMessageId,
         status: 'received',
         created_at: new Date(parseInt(timestamp) * 1000).toISOString()
@@ -173,7 +199,8 @@ async function handleIncomingMessage(messageData, whatsappNumberId, whatsappNumb
         const incomingMessage = {
           user_phone: from,
           message_type: type,
-          message_body: text?.body || ''
+          message_body: messageBody,
+          interactive: interactive // Pass interactive data for LLM service
         };
 
         const result = await processAutoReply(incomingMessage, whatsappNumber);

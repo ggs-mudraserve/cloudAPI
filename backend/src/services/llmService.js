@@ -285,18 +285,30 @@ async function saveOutgoingMessage(whatsappNumberId, userPhone, messageText, wha
  * Returns:
  * - { replied: true, reason: 'success' } if reply sent
  * - { replied: false, reason: 'limit_reached' } if 40 limit reached
- * - { replied: false, reason: 'not_text' } if message is not text
+ * - { replied: false, reason: 'not_supported_type' } if message type is not supported
  * - { replied: false, reason: 'error', error: ... } if error occurred
  */
 async function processAutoReply(incomingMessage, whatsappNumber) {
   try {
-    const { user_phone, message_type, message_body } = incomingMessage;
+    const { user_phone, message_type, message_body, interactive } = incomingMessage;
     const whatsappNumberId = whatsappNumber.id;
 
-    // Only reply to text messages
-    if (message_type !== 'text') {
-      console.log(`[LLM] Skipping auto-reply for ${user_phone}: message type is ${message_type}`);
-      return { replied: false, reason: 'not_text' };
+    // Only reply to text messages, interactive button/list replies, and button messages
+    const isTextMessage = message_type === 'text';
+    const isInteractiveReply = message_type === 'interactive' &&
+                               interactive?.type &&
+                               (interactive.type === 'button_reply' || interactive.type === 'list_reply');
+    const isButtonMessage = message_type === 'button';
+
+    if (!isTextMessage && !isInteractiveReply && !isButtonMessage) {
+      console.log(`[LLM] Skipping auto-reply for ${user_phone}: message type is ${message_type}${message_type === 'interactive' ? ` (${interactive?.type})` : ''}`);
+      return { replied: false, reason: 'not_supported_type' };
+    }
+
+    // Validate message body exists
+    if (!message_body || message_body.trim() === '') {
+      console.log(`[LLM] Skipping auto-reply for ${user_phone}: empty message body`);
+      return { replied: false, reason: 'empty_message' };
     }
 
     // Check reply limit

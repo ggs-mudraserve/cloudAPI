@@ -382,7 +382,18 @@ const Inbox = () => {
                                 : 'bg-white text-gray-900 border border-gray-200'
                             }`}
                           >
-                            <p className="text-sm whitespace-pre-wrap">{msg.message_body}</p>
+                            {/* Show button indicator for button/interactive messages */}
+                            {(msg.message_type === 'button' || msg.message_type === 'interactive') && msg.direction === 'incoming' && (
+                              <div className="flex items-center gap-1 mb-1 text-xs text-gray-500">
+                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122" />
+                                </svg>
+                                <span>Button clicked</span>
+                              </div>
+                            )}
+                            <p className="text-sm whitespace-pre-wrap">
+                              {msg.message_body || (msg.message_type === 'button' || msg.message_type === 'interactive' ? '[Button interaction]' : '[No content]')}
+                            </p>
                             <div
                               className={`text-xs mt-1 ${
                                 msg.direction === 'outgoing'

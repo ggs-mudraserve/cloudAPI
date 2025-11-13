@@ -300,7 +300,7 @@ const Settings = () => {
           <li className="flex items-start">
             <span className="mr-2">•</span>
             <span>
-              <strong>Text Messages Only:</strong> Auto-replies only respond to incoming text messages (media messages are skipped)
+              <strong>Supported Message Types:</strong> Auto-replies respond to text messages and interactive button/list replies (media messages are skipped)
             </span>
           </li>
           <li className="flex items-start">
