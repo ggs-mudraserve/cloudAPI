@@ -45,4 +45,26 @@ router.get('/search', messagesController.searchMessages);
  */
 router.get('/stats', messagesController.getConversationStats);
 
+/**
+ * POST /api/messages/send-text
+ * Send a text message to a user
+ *
+ * Body:
+ * - whatsapp_number_id: WhatsApp number ID to send from (required)
+ * - user_phone: User phone number to send to (required)
+ * - text: Message text (required)
+ */
+router.post('/send-text', messagesController.sendText);
+
+/**
+ * POST /api/messages/send-template
+ * Send a template message to a user
+ *
+ * Body:
+ * - whatsapp_number_id: WhatsApp number ID to send from (required)
+ * - user_phone: User phone number to send to (required)
+ * - template_id: Template ID to send (required)
+ */
+router.post('/send-template', messagesController.sendTemplate);
+
 module.exports = router;

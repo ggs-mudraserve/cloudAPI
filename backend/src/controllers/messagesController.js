@@ -1,4 +1,5 @@
 const { supabase } = require('../config/supabase');
+const { sendTextMessage, sendTemplateMessage } = require('../services/whatsappService');
 
 /**
  * Get all conversations grouped by user_phone
@@ -136,10 +137,18 @@ async function getFallbackConversations(whatsappNumberId, search, limit, offset)
     throw error;
   }
 
-  // Group by conversation
+  // Group by conversation and track if customer has replied
   const conversationMap = {};
+  const hasIncomingMessage = {}; // Track which conversations have incoming messages
+
   messages.forEach(msg => {
     const key = `${msg.whatsapp_number_id}_${msg.user_phone}`;
+
+    // Track if this conversation has any incoming messages (customer replied)
+    if (msg.direction === 'incoming') {
+      hasIncomingMessage[key] = true;
+    }
+
     if (!conversationMap[key]) {
       conversationMap[key] = {
         ...msg,
@@ -154,8 +163,13 @@ async function getFallbackConversations(whatsappNumberId, search, limit, offset)
     }
   });
 
+  // Filter: Only include conversations where customer has sent at least one incoming message
+  const conversationsWithReplies = Object.entries(conversationMap)
+    .filter(([key, conv]) => hasIncomingMessage[key]) // Only show if customer replied
+    .map(([key, conv]) => conv);
+
   // Sort conversations by latest message timestamp (descending)
-  const conversations = Object.values(conversationMap)
+  const conversations = conversationsWithReplies
     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
     .slice(parseInt(offset), parseInt(offset) + parseInt(limit));
 
@@ -307,14 +321,18 @@ exports.searchMessages = async (req, res) => {
  */
 exports.getConversationStats = async (req, res) => {
   try {
-    // Total conversations (distinct user_phone)
+    // Total conversations (only those where customer has replied)
     const { data: allMessages } = await supabase
       .from('messages')
-      .select('user_phone, whatsapp_number_id');
+      .select('user_phone, whatsapp_number_id, direction');
 
-    const uniqueConversations = new Set(
-      allMessages?.map(m => `${m.whatsapp_number_id}_${m.user_phone}`) || []
-    );
+    // Group by conversation and check if customer has replied
+    const conversationsWithReplies = new Set();
+    allMessages?.forEach(m => {
+      if (m.direction === 'incoming') {
+        conversationsWithReplies.add(`${m.whatsapp_number_id}_${m.user_phone}`);
+      }
+    });
 
     // Total messages
     const { count: totalMessages } = await supabase
@@ -342,7 +360,7 @@ exports.getConversationStats = async (req, res) => {
     res.json({
       success: true,
       data: {
-        total_conversations: uniqueConversations.size,
+        total_conversations: conversationsWithReplies.size,
         total_messages: totalMessages || 0,
         incoming_messages: incomingCount || 0,
         outgoing_messages: outgoingCount || 0,
@@ -355,6 +373,198 @@ exports.getConversationStats = async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to fetch conversation stats'
+    });
+  }
+};
+
+/**
+ * Send a text message to a user
+ * POST /api/messages/send-text
+ * Body: { whatsapp_number_id, user_phone, text }
+ */
+exports.sendText = async (req, res) => {
+  try {
+    const { whatsapp_number_id, user_phone, text } = req.body;
+
+    // Validate inputs
+    if (!whatsapp_number_id || !user_phone || !text) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: whatsapp_number_id, user_phone, text'
+      });
+    }
+
+    // Get WhatsApp number details
+    const { data: whatsappNumber, error: numError } = await supabase
+      .from('whatsapp_numbers')
+      .select('phone_number_id, access_token')
+      .eq('id', whatsapp_number_id)
+      .single();
+
+    if (numError || !whatsappNumber) {
+      return res.status(404).json({
+        success: false,
+        error: 'WhatsApp number not found'
+      });
+    }
+
+    // Send text message via WhatsApp API
+    const result = await sendTextMessage(
+      whatsappNumber.phone_number_id,
+      whatsappNumber.access_token,
+      user_phone,
+      text
+    );
+
+    if (!result.success) {
+      return res.status(500).json({
+        success: false,
+        error: result.error
+      });
+    }
+
+    // Save message to database
+    const { data: message, error: saveError } = await supabase
+      .from('messages')
+      .insert({
+        whatsapp_number_id,
+        user_phone,
+        direction: 'outgoing',
+        message_type: 'text',
+        message_body: text,
+        whatsapp_message_id: result.messageId,
+        status: 'sent',
+        created_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (saveError) {
+      console.error('[Messages] Error saving sent message:', saveError);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        message_id: result.messageId,
+        message: message
+      }
+    });
+
+  } catch (error) {
+    console.error('[Messages] Error sending text message:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to send text message'
+    });
+  }
+};
+
+/**
+ * Send a template message to a user
+ * POST /api/messages/send-template
+ * Body: { whatsapp_number_id, user_phone, template_id, variables }
+ */
+exports.sendTemplate = async (req, res) => {
+  try {
+    const { whatsapp_number_id, user_phone, template_id, variables = {} } = req.body;
+
+    // Validate inputs
+    if (!whatsapp_number_id || !user_phone || !template_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: whatsapp_number_id, user_phone, template_id'
+      });
+    }
+
+    // Get WhatsApp number details
+    const { data: whatsappNumber, error: numError } = await supabase
+      .from('whatsapp_numbers')
+      .select('phone_number_id, access_token')
+      .eq('id', whatsapp_number_id)
+      .single();
+
+    if (numError || !whatsappNumber) {
+      return res.status(404).json({
+        success: false,
+        error: 'WhatsApp number not found'
+      });
+    }
+
+    // Get template details
+    const { data: template, error: templateError } = await supabase
+      .from('templates')
+      .select('*')
+      .eq('id', template_id)
+      .eq('whatsapp_number_id', whatsapp_number_id)
+      .single();
+
+    if (templateError || !template) {
+      return res.status(404).json({
+        success: false,
+        error: 'Template not found'
+      });
+    }
+
+    // Check template is active and not MARKETING
+    if (!template.is_active || template.category === 'MARKETING') {
+      return res.status(400).json({
+        success: false,
+        error: 'Template is not available for use (inactive or MARKETING category)'
+      });
+    }
+
+    // Send template message via WhatsApp API with variables
+    const result = await sendTemplateMessage(
+      whatsappNumber.phone_number_id,
+      whatsappNumber.access_token,
+      user_phone,
+      template.name,
+      template.language,
+      variables, // Pass variables from request
+      template.components || []
+    );
+
+    if (!result.success) {
+      return res.status(500).json({
+        success: false,
+        error: result.error
+      });
+    }
+
+    // Save message to database
+    const { data: message, error: saveError } = await supabase
+      .from('messages')
+      .insert({
+        whatsapp_number_id,
+        user_phone,
+        direction: 'outgoing',
+        message_type: 'template',
+        message_body: null, // Templates don't have simple body text
+        whatsapp_message_id: result.messageId,
+        status: 'sent',
+        created_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (saveError) {
+      console.error('[Messages] Error saving sent template:', saveError);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        message_id: result.messageId,
+        message: message
+      }
+    });
+
+  } catch (error) {
+    console.error('[Messages] Error sending template message:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to send template message'
     });
   }
 };
