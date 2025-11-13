@@ -651,6 +651,24 @@ const Campaigns = () => {
                             {new Date(campaign.start_time).toLocaleString()}
                           </div>
                         )}
+                        {campaign.end_time && (
+                          <div>
+                            <span className="font-medium">Ended:</span>{' '}
+                            {new Date(campaign.end_time).toLocaleString()}
+                          </div>
+                        )}
+                        {campaign.start_time && campaign.end_time && campaign.total_sent > 0 && (
+                          <div>
+                            <span className="font-medium">Avg Speed:</span>{' '}
+                            {(() => {
+                              const startTime = new Date(campaign.start_time).getTime();
+                              const endTime = new Date(campaign.end_time).getTime();
+                              const durationSeconds = (endTime - startTime) / 1000;
+                              const avgSpeed = durationSeconds > 0 ? (campaign.total_sent / durationSeconds).toFixed(2) : '0';
+                              return `${avgSpeed} msg/sec`;
+                            })()}
+                          </div>
+                        )}
                       </div>
                     </div>
                     <div className="ml-6 flex space-x-2">

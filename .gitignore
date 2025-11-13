@@ -51,3 +51,19 @@ coverage/
 
 # OS files
 Thumbs.db
+
+# Backups
+*.backup
+*_backup_*
+local-supabase-backups/
+
+# Test and monitoring scripts
+test-*.js
+monitor-*.js
+check-*.js
+analyze-*.js
+apply-*.js
+backfill-*.js
+
+# SQL migration files (applied via scripts)
+create-*.sql
