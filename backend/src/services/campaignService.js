@@ -408,6 +408,7 @@ async function getCampaign(campaignId) {
       .from('send_queue')
       .select('template_name, status, phone')
       .eq('campaign_id', campaignId)
+      .order('id')
       .range(fromQueue, fromQueue + batchSize - 1);
 
     if (queueError) throw queueError;
@@ -431,6 +432,7 @@ async function getCampaign(campaignId) {
       .from('message_status_logs')
       .select('whatsapp_message_id, status, created_at')
       .eq('campaign_id', campaignId)
+      .order('id')
       .range(fromStatus, fromStatus + batchSize - 1);
 
     if (statusError) throw statusError;
@@ -464,6 +466,7 @@ async function getCampaign(campaignId) {
       .select('whatsapp_message_id, user_phone, whatsapp_number_id')
       .eq('campaign_id', campaignId)
       .eq('direction', 'outgoing')
+      .order('id')
       .range(fromMessages, fromMessages + batchSize - 1);
 
     if (messagesError) throw messagesError;
@@ -497,6 +500,7 @@ async function getCampaign(campaignId) {
       .from('messages')
       .select('user_phone, whatsapp_number_id')
       .eq('direction', 'incoming')
+      .order('id')
       .range(fromIncoming, fromIncoming + batchSize - 1);
 
     if (incomingError) throw incomingError;
@@ -519,10 +523,10 @@ async function getCampaign(campaignId) {
     }
   });
 
-  // Calculate template stats
+  // FIXED: Calculate template stats with correct logic
   const templateStats = {};
 
-  // Initialize stats from queue
+  // Step 1: Initialize from send_queue with total, sent, and failed counts
   queueStats.forEach(item => {
     if (!item.template_name) return;
 
@@ -538,9 +542,19 @@ async function getCampaign(campaignId) {
     }
 
     templateStats[item.template_name].total++;
+
+    // Count sent from send_queue (status='sent')
+    if (item.status === 'sent') {
+      templateStats[item.template_name].sent++;
+    }
+
+    // Count failed from send_queue (status='failed')
+    if (item.status === 'failed') {
+      templateStats[item.template_name].failed++;
+    }
   });
 
-  // Add status counts from message_status_logs
+  // Step 2: Add delivery/read stats from message_status_logs
   campaignMessages.forEach(msg => {
     const template = phoneToTemplate.get(msg.user_phone);
     if (!template) return;
@@ -559,22 +573,19 @@ async function getCampaign(campaignId) {
       };
     }
 
-    // Count cumulative stats
+    // Count delivered (delivered + read)
+    if (latestStatus.status === 'delivered' || latestStatus.status === 'read') {
+      templateStats[template].delivered++;
+    }
+
+    // Count read
+    if (latestStatus.status === 'read') {
+      templateStats[template].read++;
+    }
+
+    // Add WhatsApp-level failures to failed count
     if (latestStatus.status === 'failed') {
       templateStats[template].failed++;
-    } else {
-      // Sent = all non-failed
-      templateStats[template].sent++;
-
-      // Delivered = delivered + read
-      if (latestStatus.status === 'delivered' || latestStatus.status === 'read') {
-        templateStats[template].delivered++;
-      }
-
-      // Read
-      if (latestStatus.status === 'read') {
-        templateStats[template].read++;
-      }
     }
 
     // Check if user replied
@@ -583,8 +594,19 @@ async function getCampaign(campaignId) {
     }
   });
 
+  // Calculate total WhatsApp-level failures to add to campaign.total_failed
+  let totalWhatsAppFailures = 0;
+  campaignMessages.forEach(msg => {
+    const latestStatus = messageLatestStatus.get(msg.whatsapp_message_id);
+    if (latestStatus && latestStatus.status === 'failed') {
+      totalWhatsAppFailures++;
+    }
+  });
+
   return {
     ...campaign,
+    // Override total_failed to include both send_queue and WhatsApp failures
+    total_failed: campaign.total_failed + totalWhatsAppFailures,
     distribution,
     templateStats
   };

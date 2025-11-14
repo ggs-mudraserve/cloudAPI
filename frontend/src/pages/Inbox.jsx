@@ -679,9 +679,76 @@ const Inbox = () => {
                                 <span>Button clicked</span>
                               </div>
                             )}
-                            <p className="text-sm whitespace-pre-wrap">
-                              {msg.message_body || (msg.message_type === 'button' || msg.message_type === 'interactive' ? '[Button interaction]' : '[No content]')}
-                            </p>
+
+                            {/* Media Preview */}
+                            {msg.message_type === 'image' && msg.media_url && (
+                              <div className="mb-2">
+                                <img
+                                  src={`/api/media/${msg.id}`}
+                                  alt="Image message"
+                                  className="max-w-xs rounded-lg cursor-pointer hover:opacity-90 transition-opacity"
+                                  onClick={() => window.open(`/api/media/${msg.id}`, '_blank')}
+                                  onError={(e) => {
+                                    e.target.style.display = 'none';
+                                    e.target.nextSibling.style.display = 'block';
+                                  }}
+                                />
+                                <p className="text-sm text-gray-500 italic hidden">Failed to load image</p>
+                              </div>
+                            )}
+
+                            {msg.message_type === 'video' && msg.media_url && (
+                              <div className="mb-2">
+                                <video
+                                  src={`/api/media/${msg.id}`}
+                                  controls
+                                  className="max-w-xs rounded-lg"
+                                  onError={(e) => {
+                                    e.target.style.display = 'none';
+                                    e.target.nextSibling.style.display = 'block';
+                                  }}
+                                />
+                                <p className="text-sm text-gray-500 italic hidden">Failed to load video</p>
+                              </div>
+                            )}
+
+                            {msg.message_type === 'document' && msg.media_url && (
+                              <div className="mb-2 p-3 bg-gray-100 rounded-lg">
+                                <a
+                                  href={`/api/media/${msg.id}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="flex items-center gap-2 text-blue-600 hover:text-blue-800"
+                                >
+                                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                                  </svg>
+                                  <span className="text-sm font-medium">View Document</span>
+                                </a>
+                              </div>
+                            )}
+
+                            {msg.message_type === 'audio' && msg.media_url && (
+                              <div className="mb-2">
+                                <audio
+                                  src={`/api/media/${msg.id}`}
+                                  controls
+                                  className="max-w-xs"
+                                  onError={(e) => {
+                                    e.target.style.display = 'none';
+                                    e.target.nextSibling.style.display = 'block';
+                                  }}
+                                />
+                                <p className="text-sm text-gray-500 italic hidden">Failed to load audio</p>
+                              </div>
+                            )}
+
+                            {/* Message Text/Caption */}
+                            {(msg.message_body || !msg.media_url) && (
+                              <p className="text-sm whitespace-pre-wrap">
+                                {msg.message_body || (msg.message_type === 'button' || msg.message_type === 'interactive' ? '[Button interaction]' : '[No content]')}
+                              </p>
+                            )}
                             <div
                               className={`text-xs mt-1 ${
                                 msg.direction === 'outgoing'

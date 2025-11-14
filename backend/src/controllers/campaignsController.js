@@ -259,12 +259,12 @@ exports.getCampaignStats = async (req, res) => {
   try {
     const { whatsapp_number_id, status, start_date, end_date } = req.query;
 
-    // Build campaigns query with filters
+    // Build query for campaigns with filters
     let campaignsQuery = supabase
       .from('campaigns')
-      .select('id, status, total_contacts, total_sent, total_failed, whatsapp_number_id, created_at');
+      .select('*')
+      .order('created_at', { ascending: false });
 
-    // Apply filters
     if (whatsapp_number_id) {
       campaignsQuery = campaignsQuery.eq('whatsapp_number_id', whatsapp_number_id);
     }
@@ -273,22 +273,41 @@ exports.getCampaignStats = async (req, res) => {
       campaignsQuery = campaignsQuery.eq('status', status);
     }
 
-    if (start_date) {
-      campaignsQuery = campaignsQuery.gte('created_at', start_date);
+    if (start_date && end_date) {
+      campaignsQuery = campaignsQuery
+        .gte('created_at', start_date)
+        .lte('created_at', end_date);
     }
 
-    if (end_date) {
-      // Add one day to end_date to include the entire day
-      const endDateTime = new Date(end_date);
-      endDateTime.setDate(endDateTime.getDate() + 1);
-      campaignsQuery = campaignsQuery.lt('created_at', endDateTime.toISOString());
+    const { data: campaigns, error: campaignsError } = await campaignsQuery;
+
+    if (campaignsError) throw campaignsError;
+
+    if (!campaigns || campaigns.length === 0) {
+      return res.json({
+        success: true,
+        data: {
+          total_campaigns: 0,
+          running: 0,
+          scheduled: 0,
+          completed: 0,
+          paused: 0,
+          failed: 0,
+          total_contacts: 0,
+          total_sent: 0,
+          total_failed: 0,
+          message_stats: {
+            sent: { count: 0, percentage: 0 },
+            delivered: { count: 0, percentage: 0 },
+            read: { count: 0, percentage: 0 },
+            replied: { count: 0, percentage: 0 },
+            failed: { count: 0, percentage: 0 }
+          }
+        }
+      });
     }
 
-    const { data: campaigns, error: campaignError } = await campaignsQuery;
-
-    if (campaignError) throw campaignError;
-
-    // Get campaign IDs for filtering message stats
+    // Extract campaign IDs for message queries
     const campaignIds = campaigns.map(c => c.id);
 
     // Get message status statistics from message_status_logs (filtered by campaign IDs)
@@ -377,16 +396,44 @@ exports.getCampaignStats = async (req, res) => {
       else if (log.status === 'failed') latestFailed++;
     });
 
-    // Calculate cumulative counts for UI display
-    // "Delivered" means at least delivered (delivered + read)
-    // "Sent" means successfully sent (all non-failed)
-    const sentCount = latestSent + latestDelivered + latestRead; // Successfully sent (not failed)
-    const deliveredCount = latestDelivered + latestRead;         // At least delivered
-    const readCount = latestRead;                                 // Read
-    const failedCount = latestFailed;                            // Failed
+    // Get failed messages from send_queue (messages that failed during sending)
+    let sendQueueFailed = 0;
+    let fromSendQueue = 0;
+    let hasMoreSendQueue = true;
 
-    // Get total campaign messages sent
-    const totalMessages = campaigns.reduce((sum, c) => sum + (c.total_sent || 0), 0);
+    while (hasMoreSendQueue && campaignIds.length > 0) {
+      const { data: batch, error: sendQueueError } = await supabase
+        .from('send_queue')
+        .select('status')
+        .in('campaign_id', campaignIds)
+        .eq('status', 'failed')
+        .range(fromSendQueue, fromSendQueue + batchSize - 1);
+
+      if (sendQueueError) throw sendQueueError;
+
+      if (batch && batch.length > 0) {
+        sendQueueFailed += batch.length;
+        fromSendQueue += batchSize;
+        hasMoreSendQueue = batch.length === batchSize;
+      } else {
+        hasMoreSendQueue = false;
+      }
+    }
+
+    // FIXED LOGIC:
+    // "Sent" = All messages successfully sent from send_queue (total_sent from campaigns)
+    // "Delivered" = Messages that reached at least "delivered" status (delivered + read)
+    // "Read" = Messages that were read
+    // "Failed" = Failed from both send_queue and message_status_logs
+    // All percentages calculated as: count / total_contacts * 100
+    
+    const totalContacts = campaigns.reduce((sum, c) => sum + (c.total_contacts || 0), 0);
+    const totalSent = campaigns.reduce((sum, c) => sum + (c.total_sent || 0), 0);
+    const totalFailed = sendQueueFailed; // Failed during sending
+    
+    const deliveredCount = latestDelivered + latestRead;  // At least delivered
+    const readCount = latestRead;                         // Read
+    const failedCount = latestFailed + sendQueueFailed;  // Failed from both sources
 
     // Get replied count (incoming messages from users who received campaign messages)
     // Fetch ALL campaign messages using pagination
@@ -451,20 +498,12 @@ exports.getCampaignStats = async (req, res) => {
     const repliedCount = uniqueRepliers.size;
 
     // Calculate percentages correctly:
-    // - Sent %: successfully sent (non-failed) out of total_sent from campaigns table
-    // - Delivered %: at least delivered (delivered + read) out of sent count
-    // - Read %: read out of sent count
-    // - Replied %: unique users who replied out of sent count
-    // - Failed %: failed out of total unique messages with status logs
-
-    const totalContacts = campaigns.reduce((sum, c) => sum + (c.total_contacts || 0), 0);
-    const totalUniqueMessages = messageLatestStatus.size;
-
-    const sentPercentage = totalMessages > 0 ? Math.round((sentCount / totalMessages) * 100) : 0;
-    const deliveredPercentage = sentCount > 0 ? Math.round((deliveredCount / sentCount) * 100) : 0;
-    const readPercentage = sentCount > 0 ? Math.round((readCount / sentCount) * 100) : 0;
-    const repliedPercentage = sentCount > 0 ? Math.round((repliedCount / sentCount) * 100) : 0;
-    const failedPercentage = totalUniqueMessages > 0 ? Math.round((failedCount / totalUniqueMessages) * 100) : 0;
+    // All percentages use total_contacts as denominator
+    const sentPercentage = totalContacts > 0 ? Math.round((totalSent / totalContacts) * 100) : 0;
+    const deliveredPercentage = totalContacts > 0 ? Math.round((deliveredCount / totalContacts) * 100) : 0;
+    const readPercentage = totalContacts > 0 ? Math.round((readCount / totalContacts) * 100) : 0;
+    const repliedPercentage = totalContacts > 0 ? Math.round((repliedCount / totalContacts) * 100) : 0;
+    const failedPercentage = totalContacts > 0 ? Math.round((failedCount / totalContacts) * 100) : 0;
 
     const stats = {
       // Campaign-level stats
@@ -475,13 +514,13 @@ exports.getCampaignStats = async (req, res) => {
       paused: campaigns.filter(c => c.status === 'paused').length,
       failed: campaigns.filter(c => c.status === 'failed').length,
       total_contacts: totalContacts,
-      total_sent: totalMessages,
+      total_sent: totalSent,
       total_failed: campaigns.reduce((sum, c) => sum + (c.total_failed || 0), 0),
 
       // Message-level stats with correct percentages
       message_stats: {
         sent: {
-          count: sentCount, // Successfully sent (non-failed messages)
+          count: totalSent, // Total successfully sent from campaigns table
           percentage: sentPercentage
         },
         delivered: {
@@ -497,7 +536,7 @@ exports.getCampaignStats = async (req, res) => {
           percentage: repliedPercentage
         },
         failed: {
-          count: failedCount, // Failed messages
+          count: failedCount, // Failed from both sources
           percentage: failedPercentage
         }
       }
@@ -512,7 +551,8 @@ exports.getCampaignStats = async (req, res) => {
     console.error('Get campaign stats error:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to get campaign statistics'
+      message: 'Failed to get campaign statistics',
+      error: error.message
     });
   }
 };

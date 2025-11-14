@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const axios = require('axios');
 const { supabase } = require('../config/supabase');
 const { processAutoReply } = require('./llmService');
 
@@ -126,6 +127,39 @@ function shouldUpdateStatus(currentStatus, newStatus) {
 }
 
 /**
+ * Get media URL from WhatsApp Cloud API
+ * @param {string} mediaId - Media ID from webhook
+ * @param {string} accessToken - WhatsApp access token
+ * @returns {Promise<string|null>} - Media URL or null if failed
+ */
+async function getMediaUrl(mediaId, accessToken) {
+  try {
+    // Step 1: Get media URL from WhatsApp API
+    const response = await axios.get(
+      `https://graph.facebook.com/v18.0/${mediaId}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`
+        }
+      }
+    );
+
+    const mediaUrl = response.data?.url;
+    if (!mediaUrl) {
+      console.error('[Webhook] No media URL in response');
+      return null;
+    }
+
+    console.log(`[Webhook] Retrieved media URL: ${mediaUrl}`);
+    return mediaUrl;
+
+  } catch (error) {
+    console.error('[Webhook] Error fetching media URL:', error.response?.data || error.message);
+    return null;
+  }
+}
+
+/**
  * Handle incoming message webhook
  * Stores message in database and triggers auto-reply
  */
@@ -138,7 +172,11 @@ async function handleIncomingMessage(messageData, whatsappNumberId, whatsappNumb
       type,
       text,
       interactive,
-      button
+      button,
+      image,
+      video,
+      document,
+      audio
     } = messageData;
 
     // Log full message data for debugging
@@ -154,8 +192,10 @@ async function handleIncomingMessage(messageData, whatsappNumberId, whatsappNumb
       return { success: true, duplicate: true };
     }
 
-    // Extract message body based on type
+    // Extract message body and media URL based on type
     let messageBody = '';
+    let mediaUrl = null;
+
     if (type === 'text') {
       messageBody = text?.body || '';
     } else if (type === 'interactive' && interactive?.type === 'button_reply') {
@@ -170,6 +210,26 @@ async function handleIncomingMessage(messageData, whatsappNumberId, whatsappNumb
       // Some WhatsApp APIs send button clicks as type 'button'
       messageBody = button.text || button.payload || '';
       console.log(`[Webhook] Button message: "${messageBody}"`);
+    } else if (type === 'image' && image) {
+      // For image messages, get the media URL
+      messageBody = image.caption || '';
+      mediaUrl = await getMediaUrl(image.id, whatsappNumber.access_token);
+      console.log(`[Webhook] Image message: ${mediaUrl}`);
+    } else if (type === 'video' && video) {
+      // For video messages, get the media URL
+      messageBody = video.caption || '';
+      mediaUrl = await getMediaUrl(video.id, whatsappNumber.access_token);
+      console.log(`[Webhook] Video message: ${mediaUrl}`);
+    } else if (type === 'document' && document) {
+      // For document messages, get the media URL
+      messageBody = document.filename || document.caption || '';
+      mediaUrl = await getMediaUrl(document.id, whatsappNumber.access_token);
+      console.log(`[Webhook] Document message: ${mediaUrl}`);
+    } else if (type === 'audio' && audio) {
+      // For audio messages, get the media URL
+      messageBody = 'Audio message';
+      mediaUrl = await getMediaUrl(audio.id, whatsappNumber.access_token);
+      console.log(`[Webhook] Audio message: ${mediaUrl}`);
     }
 
     // Insert incoming message
@@ -181,6 +241,7 @@ async function handleIncomingMessage(messageData, whatsappNumberId, whatsappNumb
         direction: 'incoming',
         message_type: type,
         message_body: messageBody,
+        media_url: mediaUrl,
         whatsapp_message_id: whatsappMessageId,
         status: 'received',
         created_at: new Date(parseInt(timestamp) * 1000).toISOString()

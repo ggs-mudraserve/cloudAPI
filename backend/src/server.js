@@ -46,6 +46,7 @@ app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/webhooks', require('./routes/webhooks'));
 app.use('/api/messages', require('./routes/messages'));
 app.use('/api/settings', require('./routes/settings'));
+app.use('/api/media', require('./routes/media'));
 
 // Serve frontend build in production
 if (process.env.NODE_ENV === 'production') {

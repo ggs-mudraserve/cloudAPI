@@ -39,21 +39,29 @@ const Campaigns = () => {
     today.setHours(0, 0, 0, 0);
 
     if (dateFilter === 'today') {
+      const endOfDay = new Date(today);
+      endOfDay.setHours(23, 59, 59, 999);
       return {
         start_date: today.toISOString(),
-        end_date: today.toISOString()
+        end_date: endOfDay.toISOString()
       };
     } else if (dateFilter === 'current_month') {
       const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+      firstDay.setHours(0, 0, 0, 0);
       const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+      lastDay.setHours(23, 59, 59, 999);
       return {
         start_date: firstDay.toISOString(),
         end_date: lastDay.toISOString()
       };
     } else if (dateFilter === 'custom' && customStartDate && customEndDate) {
+      const startDate = new Date(customStartDate);
+      startDate.setHours(0, 0, 0, 0);
+      const endDate = new Date(customEndDate);
+      endDate.setHours(23, 59, 59, 999);
       return {
-        start_date: new Date(customStartDate).toISOString(),
-        end_date: new Date(customEndDate).toISOString()
+        start_date: startDate.toISOString(),
+        end_date: endDate.toISOString()
       };
     }
     return {};

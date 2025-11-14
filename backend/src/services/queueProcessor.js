@@ -37,7 +37,7 @@ function getDelay(messagesPerSecond) {
 /**
  * Adjust rate based on error/success patterns
  */
-async function adjustRate(whatsappNumberId, rateState, errorCode = null) {
+async function adjustRate(whatsappNumberId, rateState, errorCode = null, maxLimit = 200) {
   const now = Date.now();
 
   if (errorCode === 130429) {
@@ -81,9 +81,10 @@ async function adjustRate(whatsappNumberId, rateState, errorCode = null) {
     const errorRate = totalRecent > 0 ? recentErrors / totalRecent : 0;
 
     // Increase rate by 15% if error rate < 1% for 1 minute and we have enough samples
+    // Cap at max_limit from database (configurable per WhatsApp number)
     if (errorRate < 0.01 && totalRecent >= 60 && now - rateState.lastUpdateTime >= 1 * 60 * 1000) {
-      const newRate = Math.min(1000, Math.floor(rateState.currentRate * 1.15));
-      console.log(`[Rate Control] Increasing rate for number ${whatsappNumberId}: ${rateState.currentRate} -> ${newRate} msg/sec`);
+      const newRate = Math.min(maxLimit, Math.floor(rateState.currentRate * 1.15));
+      console.log(`[Rate Control] Increasing rate for number ${whatsappNumberId}: ${rateState.currentRate} -> ${newRate} msg/sec (max: ${maxLimit})`);
 
       rateState.currentRate = newRate;
       rateState.lastUpdateTime = now;
@@ -193,7 +194,7 @@ async function processMessage(message, whatsappNumber, rateState, templateMap) {
       });
 
       // Adjust rate (success)
-      await adjustRate(message.whatsapp_number_id, rateState, null);
+      await adjustRate(message.whatsapp_number_id, rateState, null, whatsappNumber.max_limit || 200);
 
       console.log(`[Queue] Sent message ${message.id} to ${message.phone}`);
       return { success: true };
@@ -208,9 +209,9 @@ async function processMessage(message, whatsappNumber, rateState, templateMap) {
     // Check if it's a rate limit error
     const errorCode = error.response?.data?.error?.code;
     if (errorCode === 130429) {
-      await adjustRate(message.whatsapp_number_id, rateState, 130429);
+      await adjustRate(message.whatsapp_number_id, rateState, 130429, whatsappNumber.max_limit || 200);
     } else {
-      await adjustRate(message.whatsapp_number_id, rateState, 'other');
+      await adjustRate(message.whatsapp_number_id, rateState, 'other', whatsappNumber.max_limit || 200);
     }
 
     // Handle retry logic
@@ -284,7 +285,7 @@ async function processCampaignQueue(campaignId) {
     // Get WhatsApp number details
     const { data: whatsappNumber, error: numberError} = await supabase
       .from('whatsapp_numbers')
-      .select('id, phone_number_id, access_token, max_send_rate_per_sec, is_active')
+      .select('id, phone_number_id, access_token, max_send_rate_per_sec, max_limit, is_active')
       .eq('id', campaign.whatsapp_number_id)
       .single();
 
@@ -330,9 +331,12 @@ async function processCampaignQueue(campaignId) {
     }
 
     // Initialize rate control
+    // Cap initial rate to max_limit to ensure we never exceed configured limit
+    const maxLimit = whatsappNumber.max_limit || 200;
+    const initialRate = Math.min(maxLimit, whatsappNumber.max_send_rate_per_sec || 60);
     const rateState = initRateControl(
       whatsappNumber.id,
-      whatsappNumber.max_send_rate_per_sec || 60
+      initialRate
     );
 
     // Check if already processing
