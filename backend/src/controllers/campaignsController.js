@@ -360,4 +360,102 @@ exports.getCampaignStats = async (req, res) => {
       error: error.message
     });
   }
-};;
+};
+
+/**
+ * Retry all failed messages in a campaign
+ * Resets failed messages to 'ready' status so they can be resent
+ */
+exports.retryFailedMessages = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Get campaign details
+    const { data: campaign, error: campaignError } = await supabase
+      .from('campaigns')
+      .select('id, name, status')
+      .eq('id', id)
+      .single();
+
+    if (campaignError || !campaign) {
+      return res.status(404).json({
+        success: false,
+        message: 'Campaign not found'
+      });
+    }
+
+    // Only allow retry for running or completed campaigns
+    if (!['running', 'completed', 'paused'].includes(campaign.status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Can only retry failed messages for running, paused, or completed campaigns'
+      });
+    }
+
+    // Count failed messages
+    const { count: failedCount } = await supabase
+      .from('send_queue')
+      .select('*', { count: 'exact', head: true })
+      .eq('campaign_id', id)
+      .eq('status', 'failed');
+
+    if (failedCount === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No failed messages to retry'
+      });
+    }
+
+    // Reset failed messages to ready status
+    const { error: updateError } = await supabase
+      .from('send_queue')
+      .update({
+        status: 'ready',
+        error_message: null
+      })
+      .eq('campaign_id', id)
+      .eq('status', 'failed');
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    // Update campaign total_failed counter (subtract retried count)
+    const { data: campaignData } = await supabase
+      .from('campaigns')
+      .select('total_failed')
+      .eq('id', id)
+      .single();
+
+    await supabase
+      .from('campaigns')
+      .update({
+        total_failed: Math.max(0, (campaignData?.total_failed || 0) - failedCount)
+      })
+      .eq('id', id);
+
+    // If campaign was completed, set back to running
+    if (campaign.status === 'completed') {
+      await supabase
+        .from('campaigns')
+        .update({ status: 'running' })
+        .eq('id', id);
+    }
+
+    console.log(`[Campaign] Retrying ${failedCount} failed messages for campaign ${campaign.name}`);
+
+    res.json({
+      success: true,
+      message: `${failedCount} failed messages reset to ready for retry`,
+      retriedCount: failedCount
+    });
+
+  } catch (error) {
+    console.error('Retry failed messages error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to retry messages',
+      error: error.message
+    });
+  }
+};

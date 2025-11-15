@@ -179,14 +179,8 @@ async function adjustRate(whatsappNumberId, rateState, errorCode = null, maxLimi
   }
 }
 
-/**
- * Calculate retry delay based on retry count
- * Fixed delays: 5s, 10s (only 2 retries total)
- */
-function getRetryDelay(retryCount) {
-  if (retryCount === 0) return 5000;   // 5 seconds for 1st retry
-  return 10000;  // 10 seconds for 2nd retry
-}
+// Retry logic removed - all failures are permanent
+// Users can manually retry failed messages via "Retry Failed" button
 
 /**
  * Handle automatic campaign pause due to spam detection (error 131048)
@@ -485,17 +479,16 @@ const campaignConfigCache = new Map();
  */
 async function checkAndProgressTemplate(campaignId, currentTemplateIndex, totalTemplates) {
   try {
-    // Count remaining first-attempt messages for current template
-    const { count: remainingFirstAttempts } = await supabase
+    // Count remaining messages for current template
+    const { count: remainingMessages } = await supabase
       .from('send_queue')
       .select('*', { count: 'exact', head: true })
       .eq('campaign_id', campaignId)
       .eq('template_order', currentTemplateIndex)
-      .eq('retry_count', 0)
       .in('status', ['ready', 'processing']);
 
-    if (remainingFirstAttempts === 0) {
-      // All first-attempts done for this template, move to next
+    if (remainingMessages === 0) {
+      // All messages done for this template, move to next
       let nextTemplateIndex = currentTemplateIndex + 1;
 
       // Skip templates with no messages (edge case)
@@ -511,14 +504,14 @@ async function checkAndProgressTemplate(campaignId, currentTemplateIndex, totalT
       }
 
       if (nextTemplateIndex < totalTemplates) {
-        console.log(`[Queue] ✅ Template ${currentTemplateIndex} first-attempts complete. Moving to template ${nextTemplateIndex}`);
+        console.log(`[Queue] ✅ Template ${currentTemplateIndex} complete. Moving to template ${nextTemplateIndex}`);
 
         await supabase
           .from('campaigns')
           .update({ current_template_index: nextTemplateIndex })
           .eq('id', campaignId);
       } else {
-        console.log(`[Queue] ✅ All templates' first-attempts complete. Only retries remaining.`);
+        console.log(`[Queue] ✅ All templates complete.`);
       }
     }
   } catch (error) {
@@ -624,51 +617,23 @@ async function processCampaignQueue(campaignId) {
 
     const now = new Date();
 
-    // Query 1: First-attempt messages for CURRENT template only (sequential)
-    const { data: firstAttemptMessages, error: firstAttemptError } = await supabase
+    // Fetch ready messages for CURRENT template only (sequential processing)
+    const { data: messages, error: fetchError } = await supabase
       .from('send_queue')
       .select('*')
       .eq('campaign_id', campaignId)
       .eq('status', 'ready')
       .eq('template_order', currentTemplateIndex)
-      .eq('retry_count', 0)
       .order('created_at', { ascending: true })
-      .limit(70); // Reserve 70% capacity for first attempts
+      .limit(70); // Batch size
 
-    if (firstAttemptError) {
-      console.error(`[Queue] Error fetching first-attempt messages:`, firstAttemptError);
+    if (fetchError) {
+      console.error(`[Queue] Error fetching messages:`, fetchError);
       rateState.isProcessing = false;
       return;
     }
 
-    // Query 2: Retry messages for ALL templates (run in parallel)
-    const { data: retryMessages, error: retryError } = await supabase
-      .from('send_queue')
-      .select('*')
-      .eq('campaign_id', campaignId)
-      .eq('status', 'ready')
-      .gt('retry_count', 0)
-      .order('next_retry_at', { ascending: true })
-      .limit(30); // Reserve 30% capacity for retries
-
-    if (retryError) {
-      console.error(`[Queue] Error fetching retry messages:`, retryError);
-    }
-
-    // Filter retry messages that are due (retry time has passed)
-    const dueRetryMessages = (retryMessages || []).filter(msg =>
-      !msg.next_retry_at || new Date(msg.next_retry_at) <= now
-    );
-
-    // Combine both sets
-    const allMessages = [
-      ...(firstAttemptMessages || []),
-      ...dueRetryMessages
-    ];
-
-    const messages = allMessages;
-
-    console.log(`[Queue] Fetched ${firstAttemptMessages?.length || 0} first-attempt + ${dueRetryMessages.length} retry messages = ${messages.length} total`);
+    console.log(`[Queue] Fetched ${messages?.length || 0} messages for template ${currentTemplateIndex}`);
 
     if (!messages || messages.length === 0) {
       // Check if current template's first-attempts are complete
@@ -816,7 +781,6 @@ async function processCampaignQueue(campaignId) {
     // Process results and prepare batch updates
     const sentMessageIds = [];
     const sentMessageData = [];
-    const failedMessagesForRetry = [];
     const permanentlyFailedMessages = [];
     const spamDetectedMessages = [];
 
@@ -837,31 +801,19 @@ async function processCampaignQueue(campaignId) {
           status: 'sent'
         });
       } else {
-        // Failed send
+        // Failed send - mark as permanently failed (no automatic retries)
         const errorInfo = result.status === 'fulfilled' ? result.value : { messageId: message.id, errorMessage: result.reason?.message };
-        const newRetryCount = message.retry_count + 1;
 
         // Check if spam error
         if (errorInfo.errorCode === 131048) {
           spamDetectedMessages.push(message.id);
         }
 
-        if (newRetryCount >= 2) {
-          // Permanently failed (max 2 retries)
-          permanentlyFailedMessages.push({
-            id: message.id,
-            errorMessage: errorInfo.errorMessage
-          });
-        } else {
-          // Schedule for retry
-          const retryDelay = getRetryDelay(newRetryCount);
-          failedMessagesForRetry.push({
-            id: message.id,
-            retryCount: newRetryCount,
-            errorMessage: errorInfo.errorMessage,
-            nextRetryAt: new Date(Date.now() + retryDelay).toISOString()
-          });
-        }
+        // All failures are permanent - user can manually retry via button
+        permanentlyFailedMessages.push({
+          id: message.id,
+          errorMessage: errorInfo.errorMessage
+        });
       }
     });
 
@@ -916,34 +868,16 @@ async function processCampaignQueue(campaignId) {
       }
     }
 
-    // Update 3: Schedule retries
-    if (failedMessagesForRetry.length > 0) {
-      for (const retry of failedMessagesForRetry) {
-        await supabase
-          .from('send_queue')
-          .update({
-            status: 'ready',
-            error_message: retry.errorMessage,
-            retry_count: retry.retryCount,
-            next_retry_at: retry.nextRetryAt
-          })
-          .eq('id', retry.id);
-      }
-      console.log(`[Queue] 🔄 Scheduled ${failedMessagesForRetry.length} messages for retry`);
-    }
-
-    // Update 4: Mark permanently failed
+    // Update 3: Mark permanently failed (no automatic retries)
     if (permanentlyFailedMessages.length > 0) {
-      for (const failed of permanentlyFailedMessages) {
-        await supabase
-          .from('send_queue')
-          .update({
-            status: 'failed',
-            error_message: failed.errorMessage,
-            retry_count: 2
-          })
-          .eq('id', failed.id);
-      }
+      const failedIds = permanentlyFailedMessages.map(f => f.id);
+      await supabase
+        .from('send_queue')
+        .update({
+          status: 'failed',
+          error_message: permanentlyFailedMessages[0].errorMessage // Use first error as representative
+        })
+        .in('id', failedIds);
 
       // Update in-memory counter cache (will flush based on conditions)
       cache.pendingFailed += permanentlyFailedMessages.length;

@@ -30,5 +30,6 @@ router.get('/:id', campaignsController.getCampaign);
 router.delete('/:id', campaignsController.deleteCampaign);
 router.patch('/:id/stop', campaignsController.stopCampaign);
 router.patch('/:id/resume', campaignsController.resumeCampaign);
+router.post('/:id/retry-failed', campaignsController.retryFailedMessages);
 
 module.exports = router;
