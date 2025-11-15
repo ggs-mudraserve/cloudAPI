@@ -116,6 +116,118 @@ function getRetryDelay(retryCount) {
 }
 
 /**
+ * Handle automatic campaign pause due to spam detection (error 131048)
+ *
+ * Requirements:
+ * - 1st occurrence (30 errors): Pause for 30 minutes, resume at 50% speed
+ * - 2nd occurrence: Permanently pause, require manual resume
+ */
+async function handleSpamAutoPause(campaignId, whatsappNumberId) {
+  try {
+    // Get campaign's current spam pause count
+    const { data: campaign, error: campaignError } = await supabase
+      .from('campaigns')
+      .select('spam_pause_count, name')
+      .eq('id', campaignId)
+      .single();
+
+    if (campaignError || !campaign) {
+      console.error(`[Queue] Error fetching campaign for spam pause:`, campaignError);
+      return;
+    }
+
+    const currentPauseCount = campaign.spam_pause_count || 0;
+    const newPauseCount = currentPauseCount + 1;
+
+    console.log(`[Queue] 🚨 SPAM AUTO-PAUSE TRIGGERED for campaign "${campaign.name}"`);
+    console.log(`[Queue] This is occurrence #${newPauseCount}`);
+
+    if (newPauseCount === 1) {
+      // FIRST OCCURRENCE: Pause for 30 minutes, will auto-resume at 50% speed
+      const pausedUntil = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes from now
+
+      await supabase
+        .from('campaigns')
+        .update({
+          status: 'paused',
+          spam_pause_count: newPauseCount,
+          spam_paused_until: pausedUntil.toISOString(),
+          pause_reason: `Spam filter detected (error 131048). Auto-resuming at 50% speed in 30 minutes at ${pausedUntil.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST.`
+        })
+        .eq('id', campaignId);
+
+      // Reduce send rate to 50%
+      const { data: whatsappNumber } = await supabase
+        .from('whatsapp_numbers')
+        .select('max_send_rate_per_sec')
+        .eq('id', whatsappNumberId)
+        .single();
+
+      const currentRate = whatsappNumber?.max_send_rate_per_sec || 100;
+      const newRate = Math.max(10, Math.floor(currentRate * 0.5));
+
+      await supabase
+        .from('whatsapp_numbers')
+        .update({ max_send_rate_per_sec: newRate })
+        .eq('id', whatsappNumberId);
+
+      console.log(`[Queue] ⏸️  Campaign paused for 30 minutes`);
+      console.log(`[Queue] 📉 Send rate reduced: ${currentRate} → ${newRate} msg/sec`);
+      console.log(`[Queue] ⏰ Will auto-resume at: ${pausedUntil.toISOString()}`);
+
+      // Create notification
+      await supabase
+        .from('notifications')
+        .insert({
+          type: 'campaign_spam_pause',
+          title: `Campaign "${campaign.name}" auto-paused`,
+          message: `Spam filter detected (30+ error 131048). Paused for 30 minutes, will resume at 50% speed.`,
+          severity: 'high',
+          data: {
+            campaign_id: campaignId,
+            pause_count: newPauseCount,
+            resume_at: pausedUntil.toISOString(),
+            new_rate: newRate
+          }
+        });
+
+    } else if (newPauseCount >= 2) {
+      // SECOND+ OCCURRENCE: Permanently pause, require manual resume
+      await supabase
+        .from('campaigns')
+        .update({
+          status: 'paused',
+          spam_pause_count: newPauseCount,
+          spam_paused_until: null, // No auto-resume
+          pause_reason: `Spam filter detected again (error 131048). Campaign permanently paused. Manual resume required. Please review template content and WhatsApp Business Manager quality score.`
+        })
+        .eq('id', campaignId);
+
+      console.log(`[Queue] 🛑 Campaign PERMANENTLY PAUSED (occurrence #${newPauseCount})`);
+      console.log(`[Queue] ⚠️  Manual resume required!`);
+
+      // Create high-severity notification
+      await supabase
+        .from('notifications')
+        .insert({
+          type: 'campaign_spam_permanent_pause',
+          title: `Campaign "${campaign.name}" PERMANENTLY PAUSED`,
+          message: `Spam filter triggered again (30+ error 131048). Manual review and resume required.`,
+          severity: 'critical',
+          data: {
+            campaign_id: campaignId,
+            pause_count: newPauseCount,
+            action_required: 'Review template content, check WhatsApp Business Manager quality score, then manually resume campaign'
+          }
+        });
+    }
+
+  } catch (error) {
+    console.error(`[Queue] Error in handleSpamAutoPause:`, error);
+  }
+}
+
+/**
  * Process a single message from the queue
  */
 async function processMessage(message, whatsappNumber, rateState, templateMap) {
@@ -208,7 +320,32 @@ async function processMessage(message, whatsappNumber, rateState, templateMap) {
 
     // Check if it's a rate limit error
     const errorCode = error.response?.data?.error?.code;
-    if (errorCode === 130429) {
+
+    // SPAM DETECTION: Check for error 131048
+    if (errorCode === 131048) {
+      console.warn(`[Queue] ⚠️  SPAM ERROR 131048 detected for campaign ${message.campaign_id}, template ${message.template_name}`);
+
+      // Mark this message as spam-blocked
+      await supabase
+        .from('send_queue')
+        .update({ spam_error_detected: true })
+        .eq('id', message.id);
+
+      // Check spam error count for this campaign (last 10 minutes)
+      const { data: spamCount } = await supabase
+        .rpc('count_recent_spam_errors', {
+          p_campaign_id: message.campaign_id,
+          p_minutes_ago: 10
+        });
+
+      const recentSpamErrors = spamCount || 0;
+      console.log(`[Queue] Campaign ${message.campaign_id} has ${recentSpamErrors} spam errors in last 10 minutes`);
+
+      // TRIGGER AUTO-PAUSE if >= 30 spam errors
+      if (recentSpamErrors >= 30) {
+        await handleSpamAutoPause(message.campaign_id, message.whatsapp_number_id);
+      }
+    } else if (errorCode === 130429) {
       await adjustRate(message.whatsapp_number_id, rateState, 130429, whatsappNumber.max_limit || 200);
     } else {
       await adjustRate(message.whatsapp_number_id, rateState, 'other', whatsappNumber.max_limit || 200);
@@ -259,6 +396,52 @@ async function processMessage(message, whatsappNumber, rateState, templateMap) {
 
 // Template cache per campaign
 const templateCache = new Map();
+
+/**
+ * Check if current template's first-attempts are complete and progress to next template
+ */
+async function checkAndProgressTemplate(campaignId, currentTemplateIndex, totalTemplates) {
+  try {
+    // Count remaining first-attempt messages for current template
+    const { count: remainingFirstAttempts } = await supabase
+      .from('send_queue')
+      .select('*', { count: 'exact', head: true })
+      .eq('campaign_id', campaignId)
+      .eq('template_order', currentTemplateIndex)
+      .eq('retry_count', 0)
+      .in('status', ['ready', 'processing']);
+
+    if (remainingFirstAttempts === 0) {
+      // All first-attempts done for this template, move to next
+      let nextTemplateIndex = currentTemplateIndex + 1;
+
+      // Skip templates with no messages (edge case)
+      while (nextTemplateIndex < totalTemplates) {
+        const { count: nextTemplateMessageCount } = await supabase
+          .from('send_queue')
+          .select('*', { count: 'exact', head: true })
+          .eq('campaign_id', campaignId)
+          .eq('template_order', nextTemplateIndex);
+
+        if (nextTemplateMessageCount > 0) break;
+        nextTemplateIndex++;
+      }
+
+      if (nextTemplateIndex < totalTemplates) {
+        console.log(`[Queue] ✅ Template ${currentTemplateIndex} first-attempts complete. Moving to template ${nextTemplateIndex}`);
+
+        await supabase
+          .from('campaigns')
+          .update({ current_template_index: nextTemplateIndex })
+          .eq('id', campaignId);
+      } else {
+        console.log(`[Queue] ✅ All templates' first-attempts complete. Only retries remaining.`);
+      }
+    }
+  } catch (error) {
+    console.error(`[Queue] Error in checkAndProgressTemplate:`, error);
+  }
+}
 
 /**
  * Process queue for a specific campaign
@@ -346,30 +529,65 @@ async function processCampaignQueue(campaignId) {
 
     rateState.isProcessing = true;
 
-    // Get pending messages (use FOR UPDATE SKIP LOCKED for concurrency safety)
-    // FIXED: Simplified query to avoid race condition with .or() filter
-    // Now fetches all 'ready' messages and filters retry timing in-memory for reliability
+    // SEQUENTIAL TEMPLATE PROCESSING: Get current template index
+    const currentTemplateIndex = campaign.current_template_index || 0;
+    const totalTemplates = campaign.template_names?.length || 0;
+
+    console.log(`[Queue] Campaign template progress: ${currentTemplateIndex + 1}/${totalTemplates} (template order ${currentTemplateIndex})`);
+
     const now = new Date();
-    const { data: allMessages, error: messagesError } = await supabase
+
+    // Query 1: First-attempt messages for CURRENT template only (sequential)
+    const { data: firstAttemptMessages, error: firstAttemptError } = await supabase
       .from('send_queue')
       .select('*')
       .eq('campaign_id', campaignId)
       .eq('status', 'ready')
+      .eq('template_order', currentTemplateIndex)
+      .eq('retry_count', 0)
       .order('created_at', { ascending: true })
-      .limit(100); // Process in batches
+      .limit(70); // Reserve 70% capacity for first attempts
 
-    // Filter messages that are ready to send (no retry delay or retry time has passed)
-    const messages = allMessages?.filter(msg =>
-      !msg.next_retry_at || new Date(msg.next_retry_at) <= now
-    ) || [];
-
-    if (messagesError) {
-      console.error(`[Queue] Error fetching messages for campaign ${campaignId}:`, messagesError);
+    if (firstAttemptError) {
+      console.error(`[Queue] Error fetching first-attempt messages:`, firstAttemptError);
       rateState.isProcessing = false;
       return;
     }
 
+    // Query 2: Retry messages for ALL templates (run in parallel)
+    const { data: retryMessages, error: retryError } = await supabase
+      .from('send_queue')
+      .select('*')
+      .eq('campaign_id', campaignId)
+      .eq('status', 'ready')
+      .gt('retry_count', 0)
+      .order('next_retry_at', { ascending: true })
+      .limit(30); // Reserve 30% capacity for retries
+
+    if (retryError) {
+      console.error(`[Queue] Error fetching retry messages:`, retryError);
+    }
+
+    // Filter retry messages that are due (retry time has passed)
+    const dueRetryMessages = (retryMessages || []).filter(msg =>
+      !msg.next_retry_at || new Date(msg.next_retry_at) <= now
+    );
+
+    // Combine both sets
+    const allMessages = [
+      ...(firstAttemptMessages || []),
+      ...dueRetryMessages
+    ];
+
+    const messages = allMessages;
+
+    console.log(`[Queue] Fetched ${firstAttemptMessages?.length || 0} first-attempt + ${dueRetryMessages.length} retry messages = ${messages.length} total`);
+
     if (!messages || messages.length === 0) {
+      // Check if current template's first-attempts are complete
+      if (currentTemplateIndex < totalTemplates) {
+        await checkAndProgressTemplate(campaignId, currentTemplateIndex, totalTemplates);
+      }
       console.log(`[Queue] No messages to process for campaign ${campaignId}`);
 
       // Check if campaign is complete
@@ -454,6 +672,11 @@ async function processCampaignQueue(campaignId) {
     await Promise.all(promises);
 
     rateState.isProcessing = false;
+
+    // Check if current template's first-attempts are complete and progress
+    if (currentTemplateIndex < totalTemplates) {
+      await checkAndProgressTemplate(campaignId, currentTemplateIndex, totalTemplates);
+    }
 
     // Check if there are more messages to process
     const { data: remainingMessages } = await supabase

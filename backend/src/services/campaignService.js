@@ -265,7 +265,9 @@ async function enqueueMessages(campaignId, whatsappNumberId, distribution, templ
     templateMap[template.name] = template;
   });
 
-  for (const [templateName, contacts] of Object.entries(distribution)) {
+  // CRITICAL: Process templates in order to maintain template_order consistency
+  templateNames.forEach((templateName, templateIndex) => {
+    const contacts = distribution[templateName];
     const template = templateMap[templateName];
 
     // Check if template has a media header (VIDEO, IMAGE, or DOCUMENT)
@@ -318,12 +320,13 @@ async function enqueueMessages(campaignId, whatsappNumberId, distribution, templ
         campaign_id: campaignId,
         whatsapp_number_id: whatsappNumberId,
         template_name: templateName,
+        template_order: templateIndex, // NEW: For sequential processing
         phone: contact.phone,
         payload: payload,
         status: 'ready' // Ready to be processed
       });
     }
-  }
+  });
 
   console.log(`[Campaign] Created ${queueEntries.length} queue entries, inserting into send_queue...`);
 

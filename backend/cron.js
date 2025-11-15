@@ -255,6 +255,79 @@ async function cleanupOldNotifications() {
 }
 
 /**
+ * Auto-resume campaigns that were paused due to spam detection
+ * Runs every minute
+ *
+ * Resumes campaigns where:
+ * - status = 'paused'
+ * - spam_paused_until <= NOW()
+ * - spam_pause_count = 1 (only first pause gets auto-resume)
+ */
+async function autoResumeSpamPausedCampaigns() {
+  try {
+    const now = new Date().toISOString();
+
+    // Find campaigns that should be auto-resumed
+    const { data: campaigns, error } = await supabase
+      .from('campaigns')
+      .select('id, name, spam_pause_count')
+      .eq('status', 'paused')
+      .eq('spam_pause_count', 1) // Only auto-resume first pause
+      .lte('spam_paused_until', now)
+      .not('spam_paused_until', 'is', null);
+
+    if (error) {
+      console.error('[Cron] Error fetching spam-paused campaigns:', error);
+      return;
+    }
+
+    if (!campaigns || campaigns.length === 0) {
+      return; // No campaigns to resume
+    }
+
+    console.log(`[Cron] Found ${campaigns.length} campaign(s) ready for auto-resume after spam pause`);
+
+    for (const campaign of campaigns) {
+      try {
+        console.log(`[Cron] Auto-resuming campaign "${campaign.name}" after spam cooldown...`);
+
+        // Resume campaign
+        await supabase
+          .from('campaigns')
+          .update({
+            status: 'running',
+            pause_reason: null
+            // Keep spam_pause_count=1 and spam_paused_until for history
+          })
+          .eq('id', campaign.id);
+
+        // Create notification
+        await supabase
+          .from('notifications')
+          .insert({
+            type: 'campaign_auto_resumed',
+            title: `Campaign "${campaign.name}" auto-resumed`,
+            message: `Campaign automatically resumed after 30-minute spam cooldown. Now running at 50% speed.`,
+            severity: 'medium',
+            data: {
+              campaign_id: campaign.id,
+              resumed_at: now
+            }
+          });
+
+        console.log(`[Cron] ✅ Campaign "${campaign.name}" auto-resumed successfully`);
+
+      } catch (campaignError) {
+        console.error(`[Cron] Error auto-resuming campaign "${campaign.name}":`, campaignError);
+      }
+    }
+
+  } catch (error) {
+    console.error('[Cron] Error in auto-resume spam-paused campaigns:', error);
+  }
+}
+
+/**
  * Recover stuck messages in processing state
  * Runs every 5 minutes
  */
@@ -302,6 +375,11 @@ async function startCronJobs() {
     procesScheduledCampaigns();
   });
 
+  // Auto-resume spam-paused campaigns - every minute
+  cron.schedule('* * * * *', () => {
+    autoResumeSpamPausedCampaigns();
+  });
+
   // Stuck message recovery - every 5 minutes
   cron.schedule('*/5 * * * *', () => {
     console.log('[Cron] Running stuck message recovery...');
@@ -317,6 +395,7 @@ async function startCronJobs() {
 
   console.log('✅ Cron jobs started:');
   console.log('   - Campaign scheduler: every minute');
+  console.log('   - Spam auto-resume checker: every minute');
   console.log('   - Stuck message recovery: every 5 minutes');
   console.log('   - Cleanup jobs: daily at 3 AM IST');
   console.log(`⏰ Timezone: ${process.env.TZ || 'UTC'}`);
