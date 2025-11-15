@@ -258,6 +258,7 @@ exports.resumeCampaign = async (req, res) => {
 exports.getCampaignStats = async (req, res) => {
   try {
     const { whatsapp_number_id, status, start_date, end_date } = req.query;
+    const { calculateMessageStatsWithPercentages } = require('../utils/messageStatsCalculator');
 
     // Build query for campaigns with filters
     let campaignsQuery = supabase
@@ -307,204 +308,16 @@ exports.getCampaignStats = async (req, res) => {
       });
     }
 
-    // Extract campaign IDs for message queries
+    // Extract campaign IDs and calculate totals
     const campaignIds = campaigns.map(c => c.id);
-
-    // Get message status statistics from message_status_logs (filtered by campaign IDs)
-    let statusLogsQuery = supabase
-      .from('message_status_logs')
-      .select('status, campaign_id')
-      .not('campaign_id', 'is', null);
-
-    if (campaignIds.length > 0) {
-      statusLogsQuery = statusLogsQuery.in('campaign_id', campaignIds);
-    } else {
-      // No campaigns match filters, return empty stats
-      return res.json({
-        success: true,
-        data: {
-          total_campaigns: 0,
-          running: 0,
-          scheduled: 0,
-          completed: 0,
-          paused: 0,
-          failed: 0,
-          total_contacts: 0,
-          total_sent: 0,
-          total_failed: 0,
-          message_stats: {
-            sent: { count: 0, percentage: 0 },
-            delivered: { count: 0, percentage: 0 },
-            read: { count: 0, percentage: 0 },
-            replied: { count: 0, percentage: 0 }, // Unique users who replied
-            failed: { count: 0, percentage: 0 }
-          }
-        }
-      });
-    }
-
-    const { data: statusLogs, error: statusError } = await statusLogsQuery;
-
-    if (statusError) throw statusError;
-
-    // FIXED: Get full message status logs with whatsapp_message_id to count unique messages
-    // Fetch ALL status logs using pagination to avoid the 1000 limit
-    let fullStatusLogs = [];
-    let from = 0;
-    const batchSize = 1000;
-    let hasMore = true;
-
-    while (hasMore && campaignIds.length > 0) {
-      let fullStatusLogsQuery = supabase
-        .from('message_status_logs')
-        .select('whatsapp_message_id, status, created_at')
-        .in('campaign_id', campaignIds)
-        .range(from, from + batchSize - 1);
-
-      const { data: batch, error: batchError } = await fullStatusLogsQuery;
-
-      if (batchError) throw batchError;
-
-      if (batch && batch.length > 0) {
-        fullStatusLogs = fullStatusLogs.concat(batch);
-        from += batchSize;
-        hasMore = batch.length === batchSize;
-      } else {
-        hasMore = false;
-      }
-    }
-
-    // Get latest status for each unique message
-    const messageLatestStatus = new Map();
-    (fullStatusLogs || []).forEach(log => {
-      const existing = messageLatestStatus.get(log.whatsapp_message_id);
-      if (!existing || new Date(log.created_at) > new Date(existing.created_at)) {
-        messageLatestStatus.set(log.whatsapp_message_id, log);
-      }
-    });
-
-    // Count unique messages by their LATEST status
-    let latestSent = 0;        // Still at "sent" status (not yet delivered)
-    let latestDelivered = 0;   // Reached "delivered" status (not yet read)
-    let latestRead = 0;        // Reached "read" status
-    let latestFailed = 0;      // Failed
-
-    messageLatestStatus.forEach(log => {
-      if (log.status === 'sent') latestSent++;
-      else if (log.status === 'delivered') latestDelivered++;
-      else if (log.status === 'read') latestRead++;
-      else if (log.status === 'failed') latestFailed++;
-    });
-
-    // Get failed messages from send_queue (messages that failed during sending)
-    let sendQueueFailed = 0;
-    let fromSendQueue = 0;
-    let hasMoreSendQueue = true;
-
-    while (hasMoreSendQueue && campaignIds.length > 0) {
-      const { data: batch, error: sendQueueError } = await supabase
-        .from('send_queue')
-        .select('status')
-        .in('campaign_id', campaignIds)
-        .eq('status', 'failed')
-        .range(fromSendQueue, fromSendQueue + batchSize - 1);
-
-      if (sendQueueError) throw sendQueueError;
-
-      if (batch && batch.length > 0) {
-        sendQueueFailed += batch.length;
-        fromSendQueue += batchSize;
-        hasMoreSendQueue = batch.length === batchSize;
-      } else {
-        hasMoreSendQueue = false;
-      }
-    }
-
-    // FIXED LOGIC:
-    // "Sent" = All messages successfully sent from send_queue (total_sent from campaigns)
-    // "Delivered" = Messages that reached at least "delivered" status (delivered + read)
-    // "Read" = Messages that were read
-    // "Failed" = Failed from both send_queue and message_status_logs
-    // All percentages calculated as: count / total_contacts * 100
-    
     const totalContacts = campaigns.reduce((sum, c) => sum + (c.total_contacts || 0), 0);
     const totalSent = campaigns.reduce((sum, c) => sum + (c.total_sent || 0), 0);
-    const totalFailed = sendQueueFailed; // Failed during sending
-    
-    const deliveredCount = latestDelivered + latestRead;  // At least delivered
-    const readCount = latestRead;                         // Read
-    const failedCount = latestFailed + sendQueueFailed;  // Failed from both sources
+    const totalFailed = campaigns.reduce((sum, c) => sum + (c.total_failed || 0), 0);
 
-    // Get replied count (incoming messages from users who received campaign messages)
-    // Fetch ALL campaign messages using pagination
-    let campaignMessageIds = [];
-    let fromCampaignMsg = 0;
-    let hasMoreCampaignMsg = true;
+    // Use standardized message stats calculator
+    const messageStats = await calculateMessageStatsWithPercentages(campaignIds, totalContacts);
 
-    while (hasMoreCampaignMsg && campaignIds.length > 0) {
-      let campaignMessagesQuery = supabase
-        .from('messages')
-        .select('user_phone, whatsapp_number_id')
-        .eq('direction', 'outgoing')
-        .in('campaign_id', campaignIds)
-        .range(fromCampaignMsg, fromCampaignMsg + batchSize - 1);
-
-      const { data: batch } = await campaignMessagesQuery;
-
-      if (batch && batch.length > 0) {
-        campaignMessageIds = campaignMessageIds.concat(batch);
-        fromCampaignMsg += batchSize;
-        hasMoreCampaignMsg = batch.length === batchSize;
-      } else {
-        hasMoreCampaignMsg = false;
-      }
-    }
-
-    // Get unique user conversations from campaign messages
-    const campaignUsers = new Set(
-      campaignMessageIds.map(m => `${m.whatsapp_number_id}_${m.user_phone}`)
-    );
-
-    // Fetch ALL incoming messages using pagination
-    let incomingMessages = [];
-    let fromIncoming = 0;
-    let hasMoreIncoming = true;
-
-    while (hasMoreIncoming) {
-      let incomingMessagesQuery = supabase
-        .from('messages')
-        .select('user_phone, whatsapp_number_id')
-        .eq('direction', 'incoming')
-        .range(fromIncoming, fromIncoming + batchSize - 1);
-
-      const { data: batch } = await incomingMessagesQuery;
-
-      if (batch && batch.length > 0) {
-        incomingMessages = incomingMessages.concat(batch);
-        fromIncoming += batchSize;
-        hasMoreIncoming = batch.length === batchSize;
-      } else {
-        hasMoreIncoming = false;
-      }
-    }
-
-    // Get unique phone numbers who replied at least once
-    const uniqueRepliers = new Set();
-    incomingMessages.forEach(m => {
-      if (campaignUsers.has(`${m.whatsapp_number_id}_${m.user_phone}`)) {
-        uniqueRepliers.add(`${m.whatsapp_number_id}_${m.user_phone}`);
-      }
-    });
-    const repliedCount = uniqueRepliers.size;
-
-    // Calculate percentages correctly:
-    // All percentages use total_contacts as denominator
-    const sentPercentage = totalContacts > 0 ? Math.round((totalSent / totalContacts) * 100) : 0;
-    const deliveredPercentage = totalContacts > 0 ? Math.round((deliveredCount / totalContacts) * 100) : 0;
-    const readPercentage = totalContacts > 0 ? Math.round((readCount / totalContacts) * 100) : 0;
-    const repliedPercentage = totalContacts > 0 ? Math.round((repliedCount / totalContacts) * 100) : 0;
-    const failedPercentage = totalContacts > 0 ? Math.round((failedCount / totalContacts) * 100) : 0;
-
+    // Build response with campaign-level stats
     const stats = {
       // Campaign-level stats
       total_campaigns: campaigns.length,
@@ -515,29 +328,21 @@ exports.getCampaignStats = async (req, res) => {
       failed: campaigns.filter(c => c.status === 'failed').length,
       total_contacts: totalContacts,
       total_sent: totalSent,
-      total_failed: campaigns.reduce((sum, c) => sum + (c.total_failed || 0), 0),
+      total_failed: totalFailed,
 
-      // Message-level stats with correct percentages
+      // Message-level stats with standardized counting
       message_stats: {
         sent: {
-          count: totalSent, // Total successfully sent from campaigns table
-          percentage: sentPercentage
+          count: totalSent, // From campaign.total_sent (actually sent from send_queue)
+          percentage: totalContacts > 0 ? Math.round((totalSent / totalContacts) * 100) : 0
         },
-        delivered: {
-          count: deliveredCount, // At least delivered (delivered + read)
-          percentage: deliveredPercentage
-        },
-        read: {
-          count: readCount, // Read messages
-          percentage: readPercentage
-        },
-        replied: {
-          count: repliedCount, // Unique users who replied
-          percentage: repliedPercentage
-        },
+        delivered: messageStats.delivered, // At least delivered (delivered + read)
+        read: messageStats.read,
+        replied: messageStats.replied,
         failed: {
-          count: failedCount, // Failed from both sources
-          percentage: failedPercentage
+          // Combine send-queue failures AND WhatsApp delivery failures
+          count: totalFailed + messageStats.failed.count,
+          percentage: totalContacts > 0 ? Math.round(((totalFailed + messageStats.failed.count) / totalContacts) * 100) : 0
         }
       }
     };
@@ -555,4 +360,4 @@ exports.getCampaignStats = async (req, res) => {
       error: error.message
     });
   }
-};
+};;

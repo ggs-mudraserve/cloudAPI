@@ -8,7 +8,7 @@ const { validateJWT } = require('../middleware/auth');
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB max file size
+    fileSize: 50 * 1024 * 1024 // 50MB max file size (for large campaigns)
   },
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'text/csv' || file.originalname.endsWith('.csv')) {

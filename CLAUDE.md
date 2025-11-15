@@ -22,7 +22,16 @@ This project has access to specialized MCP (Model Context Protocol) servers. **A
 
 ### Database Access (Self-Hosted Supabase)
 
-**Important:** This project uses a self-hosted Supabase instance on the same VPS. Access the database using:
+**⚠️ CRITICAL: THIS PROJECT USES SELF-HOSTED SUPABASE ONLY**
+
+**NEVER use cloud Supabase URLs or keys:**
+- ❌ NEVER use `https://facxofxojjfqvpxmyavl.supabase.co`
+- ❌ NEVER use cloud anon keys or service role keys
+- ❌ NEVER query cloud Supabase database
+
+**ALWAYS use local self-hosted Supabase:**
+- ✅ ONLY use `http://localhost:8000`
+- ✅ ONLY use local service key: `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaXNzIjoic3VwYWJhc2UiLCJpYXQiOjE3NTYzOTk2MTIsImV4cCI6MjA3MTc1OTYxMn0.8vwMwbB_VU6Qsul07ev7cfeAHI1qsFIBUJ_x5bds3tU`
 
 **Method 1: Supabase Client (Preferred)**
 ```javascript
@@ -30,9 +39,9 @@ const { supabase } = require('./src/config/supabase');
 const { data, error } = await supabase.from('table_name').select('*');
 ```
 
-**Method 2: Node.js Script**
+**Method 2: Node.js Script from backend directory**
 ```bash
-node -e "
+cd /root/cloudAPI/backend && node -e "
 const { supabase } = require('./src/config/supabase');
 (async () => {
   const { data, error } = await supabase.from('table_name').select('*');
@@ -47,6 +56,7 @@ const { supabase } = require('./src/config/supabase');
 - ✅ Use exact spelling (plural/singular matters: `campaigns` not `campaign`)
 - ✅ Check foreign key relationships before queries
 - ✅ Use transactions for multi-step operations
+- ✅ ALWAYS run Node.js scripts from `/root/cloudAPI/backend` directory to access dependencies
 
 ### Context7 MCP Server (For Coding)
 
@@ -92,11 +102,13 @@ const { supabase } = require('./src/config/supabase');
 3. ✅ Avoid using outdated examples
 
 **Common mistakes to avoid:**
+- ❌ **CRITICAL:** Using cloud Supabase URLs or keys instead of localhost:8000
 - ❌ Assuming table names without checking database.md
 - ❌ Using singular when table is plural (campaign vs campaigns)
 - ❌ Forgetting underscores (campaign_contacts not campaigncontacts)
 - ❌ Using old library syntax without checking docs
 - ❌ Trying to use Supabase MCP (not available for self-hosted instances)
+- ❌ Running Node.js scripts without `cd /root/cloudAPI/backend` first
 
 ---
 

@@ -235,10 +235,17 @@ async function createCampaign(campaignData, csvBuffer) {
  * Enqueue messages for a campaign
  */
 async function enqueueMessages(campaignId, whatsappNumberId, distribution, templateMediaUrls = {}) {
+  console.log(`[Campaign] enqueueMessages called for campaign ${campaignId}`);
+  console.log(`[Campaign] Distribution keys:`, Object.keys(distribution));
+  console.log(`[Campaign] Total contacts across all templates:`,
+    Object.values(distribution).reduce((sum, contacts) => sum + contacts.length, 0));
+
   const queueEntries = [];
 
   // Fetch template components for all templates in this campaign
   const templateNames = Object.keys(distribution);
+  console.log(`[Campaign] Fetching ${templateNames.length} template(s):`, templateNames);
+
   const { data: templates, error: templateError } = await supabase
     .from('templates')
     .select('name, components')
@@ -246,9 +253,11 @@ async function enqueueMessages(campaignId, whatsappNumberId, distribution, templ
     .in('name', templateNames);
 
   if (templateError) {
-    console.error('Error fetching templates for enqueueing:', templateError);
+    console.error('[Campaign] Error fetching templates for enqueueing:', templateError);
     throw templateError;
   }
+
+  console.log(`[Campaign] Fetched ${templates?.length || 0} template(s) from database`);
 
   // Create a map of template name -> template data
   const templateMap = {};
@@ -316,11 +325,23 @@ async function enqueueMessages(campaignId, whatsappNumberId, distribution, templ
     }
   }
 
+  console.log(`[Campaign] Created ${queueEntries.length} queue entries, inserting into send_queue...`);
+
+  if (queueEntries.length === 0) {
+    console.warn(`[Campaign] WARNING: No queue entries created! Campaign ${campaignId} will complete immediately.`);
+    return;
+  }
+
   const { error } = await supabase
     .from('send_queue')
     .insert(queueEntries);
 
-  if (error) throw error;
+  if (error) {
+    console.error(`[Campaign] Failed to insert queue entries:`, error);
+    throw error;
+  }
+
+  console.log(`[Campaign] ✅ Successfully inserted ${queueEntries.length} messages into send_queue`);
 }
 
 /**
@@ -358,255 +379,69 @@ async function listCampaigns(filters = {}) {
  * Get single campaign with details
  */
 async function getCampaign(campaignId) {
-  const { data: campaign, error: campaignError } = await supabase
-    .from('campaigns')
-    .select(`
-      *,
-      whatsapp_numbers (
-        id,
-        number,
-        display_name
-      )
-    `)
-    .eq('id', campaignId)
-    .single();
+  const { calculateTemplateStats } = require('../utils/messageStatsCalculator');
 
-  if (campaignError) throw campaignError;
+  // Fetch campaign and template stats in parallel for better performance
+  const [campaignResult, templateStats] = await Promise.all([
+    supabase
+      .from('campaigns')
+      .select(`
+        *,
+        whatsapp_numbers (
+          id,
+          number,
+          display_name
+        )
+      `)
+      .eq('id', campaignId)
+      .single(),
+    calculateTemplateStats(campaignId)
+  ]);
 
-  // Get contact statistics
-  const { data: contactStats, error: statsError } = await supabase
-    .from('campaign_contacts')
-    .select('template_name, is_valid')
-    .eq('campaign_id', campaignId);
+  if (campaignResult.error) throw campaignResult.error;
 
-  if (statsError) throw statsError;
+  // PERFORMANCE FIX: Use aggregation instead of fetching all campaign_contacts records
+  // For large campaigns (50k+ contacts), this is much faster
+  const { data: distributionData, error: distError } = await supabase
+    .rpc('get_campaign_contact_distribution', { p_campaign_id: campaignId });
 
-  // Calculate distribution
-  const distribution = {};
-  contactStats.forEach(contact => {
-    if (!contact.template_name) return;
+  let distribution = {};
 
-    if (!distribution[contact.template_name]) {
-      distribution[contact.template_name] = { valid: 0, invalid: 0 };
-    }
+  if (distError) {
+    // Fallback to old method if RPC doesn't exist (backward compatibility)
+    console.warn('RPC get_campaign_contact_distribution not found, using fallback method');
+    const { data: contactStats, error: statsError } = await supabase
+      .from('campaign_contacts')
+      .select('template_name, is_valid')
+      .eq('campaign_id', campaignId);
 
-    if (contact.is_valid) {
-      distribution[contact.template_name].valid++;
-    } else {
-      distribution[contact.template_name].invalid++;
-    }
-  });
+    if (statsError) throw statsError;
 
-  // Get send statistics per template from send_queue with pagination
-  let queueStats = [];
-  let fromQueue = 0;
-  const batchSize = 1000;
-  let hasMoreQueue = true;
+    contactStats.forEach(contact => {
+      if (!contact.template_name) return;
 
-  while (hasMoreQueue) {
-    const { data: batch, error: queueError } = await supabase
-      .from('send_queue')
-      .select('template_name, status, phone')
-      .eq('campaign_id', campaignId)
-      .order('id')
-      .range(fromQueue, fromQueue + batchSize - 1);
+      if (!distribution[contact.template_name]) {
+        distribution[contact.template_name] = { valid: 0, invalid: 0 };
+      }
 
-    if (queueError) throw queueError;
-
-    if (batch && batch.length > 0) {
-      queueStats = queueStats.concat(batch);
-      fromQueue += batchSize;
-      hasMoreQueue = batch.length === batchSize;
-    } else {
-      hasMoreQueue = false;
-    }
-  }
-
-  // Get message status logs for this campaign with pagination
-  let statusLogs = [];
-  let fromStatus = 0;
-  let hasMoreStatus = true;
-
-  while (hasMoreStatus) {
-    const { data: batch, error: statusError } = await supabase
-      .from('message_status_logs')
-      .select('whatsapp_message_id, status, created_at')
-      .eq('campaign_id', campaignId)
-      .order('id')
-      .range(fromStatus, fromStatus + batchSize - 1);
-
-    if (statusError) throw statusError;
-
-    if (batch && batch.length > 0) {
-      statusLogs = statusLogs.concat(batch);
-      fromStatus += batchSize;
-      hasMoreStatus = batch.length === batchSize;
-    } else {
-      hasMoreStatus = false;
-    }
-  }
-
-  // Get latest status for each message
-  const messageLatestStatus = new Map();
-  statusLogs.forEach(log => {
-    const existing = messageLatestStatus.get(log.whatsapp_message_id);
-    if (!existing || new Date(log.created_at) > new Date(existing.created_at)) {
-      messageLatestStatus.set(log.whatsapp_message_id, log);
-    }
-  });
-
-  // Get campaign messages with template info
-  let campaignMessages = [];
-  let fromMessages = 0;
-  let hasMoreMessages = true;
-
-  while (hasMoreMessages) {
-    const { data: batch, error: messagesError } = await supabase
-      .from('messages')
-      .select('whatsapp_message_id, user_phone, whatsapp_number_id')
-      .eq('campaign_id', campaignId)
-      .eq('direction', 'outgoing')
-      .order('id')
-      .range(fromMessages, fromMessages + batchSize - 1);
-
-    if (messagesError) throw messagesError;
-
-    if (batch && batch.length > 0) {
-      campaignMessages = campaignMessages.concat(batch);
-      fromMessages += batchSize;
-      hasMoreMessages = batch.length === batchSize;
-    } else {
-      hasMoreMessages = false;
-    }
-  }
-
-  // Create map of phone -> template from send_queue
-  const phoneToTemplate = new Map();
-  queueStats.forEach(item => {
-    if (item.template_name && item.phone) {
-      phoneToTemplate.set(item.phone, item.template_name);
-    }
-  });
-
-  // Get incoming messages (replies) with pagination
-  const campaignUsers = new Set(campaignMessages.map(m => `${m.whatsapp_number_id}_${m.user_phone}`));
-
-  let incomingMessages = [];
-  let fromIncoming = 0;
-  let hasMoreIncoming = true;
-
-  while (hasMoreIncoming) {
-    const { data: batch, error: incomingError } = await supabase
-      .from('messages')
-      .select('user_phone, whatsapp_number_id')
-      .eq('direction', 'incoming')
-      .order('id')
-      .range(fromIncoming, fromIncoming + batchSize - 1);
-
-    if (incomingError) throw incomingError;
-
-    if (batch && batch.length > 0) {
-      incomingMessages = incomingMessages.concat(batch);
-      fromIncoming += batchSize;
-      hasMoreIncoming = batch.length === batchSize;
-    } else {
-      hasMoreIncoming = false;
-    }
-  }
-
-  // Map replies to templates
-  const repliesByPhone = new Map();
-  incomingMessages.forEach(m => {
-    const key = `${m.whatsapp_number_id}_${m.user_phone}`;
-    if (campaignUsers.has(key)) {
-      repliesByPhone.set(m.user_phone, true);
-    }
-  });
-
-  // FIXED: Calculate template stats with correct logic
-  const templateStats = {};
-
-  // Step 1: Initialize from send_queue with total, sent, and failed counts
-  queueStats.forEach(item => {
-    if (!item.template_name) return;
-
-    if (!templateStats[item.template_name]) {
-      templateStats[item.template_name] = {
-        total: 0,
-        sent: 0,
-        delivered: 0,
-        read: 0,
-        replied: 0,
-        failed: 0
+      if (contact.is_valid) {
+        distribution[contact.template_name].valid++;
+      } else {
+        distribution[contact.template_name].invalid++;
+      }
+    });
+  } else {
+    // Use optimized aggregation result
+    distributionData.forEach(row => {
+      distribution[row.template_name] = {
+        valid: parseInt(row.valid_count),
+        invalid: parseInt(row.invalid_count)
       };
-    }
-
-    templateStats[item.template_name].total++;
-
-    // Count sent from send_queue (status='sent')
-    if (item.status === 'sent') {
-      templateStats[item.template_name].sent++;
-    }
-
-    // Count failed from send_queue (status='failed')
-    if (item.status === 'failed') {
-      templateStats[item.template_name].failed++;
-    }
-  });
-
-  // Step 2: Add delivery/read stats from message_status_logs
-  campaignMessages.forEach(msg => {
-    const template = phoneToTemplate.get(msg.user_phone);
-    if (!template) return;
-
-    const latestStatus = messageLatestStatus.get(msg.whatsapp_message_id);
-    if (!latestStatus) return;
-
-    if (!templateStats[template]) {
-      templateStats[template] = {
-        total: 0,
-        sent: 0,
-        delivered: 0,
-        read: 0,
-        replied: 0,
-        failed: 0
-      };
-    }
-
-    // Count delivered (delivered + read)
-    if (latestStatus.status === 'delivered' || latestStatus.status === 'read') {
-      templateStats[template].delivered++;
-    }
-
-    // Count read
-    if (latestStatus.status === 'read') {
-      templateStats[template].read++;
-    }
-
-    // Add WhatsApp-level failures to failed count
-    if (latestStatus.status === 'failed') {
-      templateStats[template].failed++;
-    }
-
-    // Check if user replied
-    if (repliesByPhone.has(msg.user_phone)) {
-      templateStats[template].replied++;
-    }
-  });
-
-  // Calculate total WhatsApp-level failures to add to campaign.total_failed
-  let totalWhatsAppFailures = 0;
-  campaignMessages.forEach(msg => {
-    const latestStatus = messageLatestStatus.get(msg.whatsapp_message_id);
-    if (latestStatus && latestStatus.status === 'failed') {
-      totalWhatsAppFailures++;
-    }
-  });
+    });
+  }
 
   return {
-    ...campaign,
-    // Override total_failed to include both send_queue and WhatsApp failures
-    total_failed: campaign.total_failed + totalWhatsAppFailures,
+    ...campaignResult.data,
     distribution,
     templateStats
   };

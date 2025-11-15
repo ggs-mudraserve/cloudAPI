@@ -1,0 +1,25 @@
+{
+  "campaign": {
+    "name": "first 50k",
+    "id": "3ef2a070-416f-4c49-9353-38562f56417a"
+  },
+  "exportDate": "2025-11-14T05:43:46.837Z",
+  "total": 6104,
+  "breakdown": {
+    "genericUserError": 5093,
+    "rateLimit": 1011,
+    "other": 0
+  },
+  "files": {
+    "allFailedCsv": "failed_numbers_all_2025-11-14.csv",
+    "genericErrorPhones": "failed_numbers_generic_error_2025-11-14.txt",
+    "rateLimitPhones": "failed_numbers_rate_limit_2025-11-14.txt",
+    "verificationCsv": "failed_numbers_to_verify_2025-11-14.csv",
+    "summary": "failed_numbers_summary_2025-11-14.json"
+  },
+  "recommendations": {
+    "genericUserError": "These numbers likely do not exist on WhatsApp or have blocked your business. Verify manually and remove from contact list.",
+    "rateLimit": "These are valid numbers but failed due to rate limiting. Can be retried in a new campaign with slower send rate.",
+    "action": "Focus on verifying the Generic User Error numbers (5093 total) as these are most likely invalid."
+  }
+}

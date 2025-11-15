@@ -1,12 +1,24 @@
 #!/usr/bin/env node
 
 /**
+ * ⚠️ OBSOLETE SCRIPT - DO NOT USE ⚠️
+ * This script was used for cloud Supabase migration.
+ * We now use LOCAL self-hosted Supabase at http://localhost:8000
+ *
+ * Kept for historical reference only.
+ * Last used: November 2025
+ *
  * Apply use_template_media migration using direct query
  */
+
+console.error('⚠️ OBSOLETE SCRIPT - This script is for cloud Supabase only.');
+console.error('We now use LOCAL Supabase. Exiting...');
+process.exit(1);
 
 const { Pool } = require('pg');
 require('dotenv').config();
 
+// OLD CLOUD SUPABASE - DO NOT USE
 // Extract connection details from SUPABASE_URL
 // Format: https://facxofxojjfqvpxmyavl.supabase.co
 const projectRef = 'facxofxojjfqvpxmyavl';
