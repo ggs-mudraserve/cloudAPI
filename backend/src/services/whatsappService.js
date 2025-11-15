@@ -2,6 +2,21 @@ const axios = require('axios');
 
 const WHATSAPP_API_BASE = 'https://graph.facebook.com/v18.0';
 
+// HTTP Keep-Alive agent will be injected from queueProcessor
+let whatsappClient = axios.create({
+  baseURL: WHATSAPP_API_BASE,
+  timeout: 30000
+});
+
+// Function to set the keep-alive agent (called from queueProcessor)
+function setHttpAgent(agent) {
+  whatsappClient = axios.create({
+    baseURL: WHATSAPP_API_BASE,
+    httpsAgent: agent,
+    timeout: 30000
+  });
+}
+
 /**
  * Test connection to WhatsApp Cloud API
  * Validates access token by fetching phone number details
@@ -132,8 +147,8 @@ async function sendTemplateMessage(phoneNumberId, accessToken, to, templateName,
     // DEBUG: Log the payload being sent
     console.log('[WhatsApp] Sending payload:', JSON.stringify(payload, null, 2));
 
-    const response = await axios.post(
-      `${WHATSAPP_API_BASE}/${cleanPhoneId}/messages`,
+    const response = await whatsappClient.post(
+      `/${cleanPhoneId}/messages`,
       payload,
       {
         headers: {
@@ -174,8 +189,8 @@ async function sendTextMessage(phoneNumberId, accessToken, to, text) {
       }
     };
 
-    const response = await axios.post(
-      `${WHATSAPP_API_BASE}/${phoneNumberId}/messages`,
+    const response = await whatsappClient.post(
+      `/${phoneNumberId}/messages`,
       payload,
       {
         headers: {
@@ -348,5 +363,6 @@ module.exports = {
   sendTextMessage,
   fetchTemplates,
   markMessageAsRead,
-  getBusinessProfile
+  getBusinessProfile,
+  setHttpAgent
 };

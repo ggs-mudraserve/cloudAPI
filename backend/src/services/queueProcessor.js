@@ -1,5 +1,23 @@
 const { supabase } = require('../config/supabase');
-const { sendTemplateMessage } = require('./whatsappService');
+const whatsappService = require('./whatsappService');
+const { sendTemplateMessage } = whatsappService;
+const pLimit = require('p-limit');
+const HttpsAgent = require('agentkeepalive').HttpsAgent;
+
+// HTTP Keep-Alive agent for optimal connection reuse
+const keepaliveAgent = new HttpsAgent({
+  maxSockets: 100,           // Max concurrent connections
+  maxFreeSockets: 10,        // Max idle connections to keep
+  timeout: 60000,            // Active socket timeout (60s)
+  freeSocketTimeout: 30000,  // Idle socket timeout (30s)
+  socketActiveTTL: 60000     // Max socket lifetime (60s)
+});
+
+// Initialize the HTTP agent in whatsappService
+whatsappService.setHttpAgent(keepaliveAgent);
+
+// Export agent for use in whatsappService
+module.exports.keepaliveAgent = keepaliveAgent;
 
 /**
  * Queue Processor for Campaign Messages
@@ -107,12 +125,11 @@ async function adjustRate(whatsappNumberId, rateState, errorCode = null, maxLimi
 
 /**
  * Calculate retry delay based on retry count
- * Exponential backoff: 5s, 20s, 45s
+ * Fixed delays: 5s, 10s (only 2 retries total)
  */
 function getRetryDelay(retryCount) {
-  if (retryCount === 0) return 5000;   // 5 seconds
-  if (retryCount === 1) return 20000;  // 20 seconds
-  return 45000; // 45 seconds
+  if (retryCount === 0) return 5000;   // 5 seconds for 1st retry
+  return 10000;  // 10 seconds for 2nd retry
 }
 
 /**
@@ -351,11 +368,11 @@ async function processMessage(message, whatsappNumber, rateState, templateMap) {
       await adjustRate(message.whatsapp_number_id, rateState, 'other', whatsappNumber.max_limit || 200);
     }
 
-    // Handle retry logic
+    // Handle retry logic (max 2 retries)
     const newRetryCount = message.retry_count + 1;
 
-    if (newRetryCount >= 3) {
-      // Max retries reached, mark as failed
+    if (newRetryCount >= 2) {
+      // Max retries reached (2 attempts), mark as failed
       await supabase
         .from('send_queue')
         .update({
@@ -370,11 +387,11 @@ async function processMessage(message, whatsappNumber, rateState, templateMap) {
         _campaign_id: message.campaign_id
       });
 
-      console.log(`[Queue] Message ${message.id} failed after ${newRetryCount} attempts`);
+      console.log(`[Queue] Message ${message.id} failed after ${newRetryCount + 1} attempts (1 initial + ${newRetryCount} retries)`);
       return { success: false, error: error.message };
 
     } else {
-      // Schedule retry
+      // Schedule retry (will be retry 1 or 2)
       const retryDelay = getRetryDelay(newRetryCount);
       const nextRetryAt = new Date(Date.now() + retryDelay).toISOString();
 
@@ -388,7 +405,7 @@ async function processMessage(message, whatsappNumber, rateState, templateMap) {
         })
         .eq('id', message.id);
 
-      console.log(`[Queue] Message ${message.id} scheduled for retry ${newRetryCount}/3 in ${retryDelay}ms`);
+      console.log(`[Queue] Message ${message.id} scheduled for retry ${newRetryCount}/2 in ${retryDelay}ms`);
       return { success: false, retry: true };
     }
   }
@@ -396,6 +413,9 @@ async function processMessage(message, whatsappNumber, rateState, templateMap) {
 
 // Template cache per campaign
 const templateCache = new Map();
+
+// Campaign configuration cache (to avoid repeated DB queries)
+const campaignConfigCache = new Map();
 
 /**
  * Check if current template's first-attempts are complete and progress to next template
@@ -651,25 +671,235 @@ async function processCampaignQueue(campaignId) {
     // Get template map from cache (reuse cacheKey from above)
     const templateMap = templateCache.get(`${campaign.whatsapp_number_id}_templates`);
 
-    // Process messages with rate limiting - STAGGERED PARALLEL PROCESSING
-    // Send messages in parallel but stagger the start times to respect rate limit
-    const delay = getDelay(rateState.currentRate);
-    const promises = messages.map((message, index) => {
-      return new Promise((resolve) => {
-        setTimeout(async () => {
-          try {
-            await processMessage(message, whatsappNumber, rateState, templateMap);
-            resolve({ success: true });
-          } catch (error) {
-            console.error(`[Queue] Error in staggered processing:`, error);
-            resolve({ success: false, error });
+    // OPTIMIZED PARALLEL PROCESSING with p-limit
+    const CONCURRENT_REQUESTS = 10; // Send 10 messages in parallel
+    const limit = pLimit(CONCURRENT_REQUESTS);
+
+    // Create tasks with concurrency control
+    const sendTasks = messages.map(message =>
+      limit(async () => {
+        try {
+          // Update status to processing
+          await supabase
+            .from('send_queue')
+            .update({ status: 'processing' })
+            .eq('id', message.id);
+
+          // Get template from cache
+          const template = templateMap ? templateMap[message.template_name] : null;
+          if (!template) {
+            throw new Error(`Template ${message.template_name} not found in cache`);
           }
-        }, index * delay); // Stagger each message by delay ms
-      });
+
+          // Send message via WhatsApp API (will use keep-alive agent)
+          const result = await sendTemplateMessage(
+            whatsappNumber.phone_number_id,
+            whatsappNumber.access_token,
+            message.phone,
+            message.template_name,
+            template.language,
+            message.payload,
+            template.components
+          );
+
+          if (result.success) {
+            // Adjust rate (success)
+            await adjustRate(message.whatsapp_number_id, rateState, null, whatsappNumber.max_limit || 80);
+            return {
+              success: true,
+              messageId: message.id,
+              whatsappMessageId: result.messageId,
+              phone: message.phone,
+              campaignId: message.campaign_id
+            };
+          } else {
+            throw new Error(result.error || 'Failed to send message');
+          }
+        } catch (error) {
+          // Check error code for rate limiting and spam detection
+          const errorCode = error.response?.data?.error?.code;
+
+          // SPAM DETECTION: Check for error 131048
+          if (errorCode === 131048) {
+            console.warn(`[Queue] ⚠️  SPAM ERROR 131048 detected for message ${message.id}`);
+            // Mark as spam-detected for later handling
+          } else if (errorCode === 130429) {
+            await adjustRate(message.whatsapp_number_id, rateState, 130429, whatsappNumber.max_limit || 80);
+          } else {
+            await adjustRate(message.whatsapp_number_id, rateState, 'other', whatsappNumber.max_limit || 80);
+          }
+
+          return {
+            success: false,
+            messageId: message.id,
+            errorMessage: error.message,
+            errorCode: errorCode,
+            retryCount: message.retry_count
+          };
+        }
+      })
+    );
+
+    // Execute all tasks with concurrency control and get results
+    const results = await Promise.allSettled(sendTasks);
+
+    // Process results and prepare batch updates
+    const sentMessageIds = [];
+    const sentMessageData = [];
+    const failedMessagesForRetry = [];
+    const permanentlyFailedMessages = [];
+    const spamDetectedMessages = [];
+
+    results.forEach((result, index) => {
+      const message = messages[index];
+
+      if (result.status === 'fulfilled' && result.value.success) {
+        // Successful send
+        sentMessageIds.push(result.value.messageId);
+        sentMessageData.push({
+          whatsapp_number_id: message.whatsapp_number_id,
+          whatsapp_message_id: result.value.whatsappMessageId,
+          user_phone: result.value.phone,
+          direction: 'outgoing',
+          message_type: 'template',
+          campaign_id: result.value.campaignId,
+          template_name: message.template_name,
+          status: 'sent'
+        });
+      } else {
+        // Failed send
+        const errorInfo = result.status === 'fulfilled' ? result.value : { messageId: message.id, errorMessage: result.reason?.message };
+        const newRetryCount = message.retry_count + 1;
+
+        // Check if spam error
+        if (errorInfo.errorCode === 131048) {
+          spamDetectedMessages.push(message.id);
+        }
+
+        if (newRetryCount >= 2) {
+          // Permanently failed (max 2 retries)
+          permanentlyFailedMessages.push({
+            id: message.id,
+            errorMessage: errorInfo.errorMessage
+          });
+        } else {
+          // Schedule for retry
+          const retryDelay = getRetryDelay(newRetryCount);
+          failedMessagesForRetry.push({
+            id: message.id,
+            retryCount: newRetryCount,
+            errorMessage: errorInfo.errorMessage,
+            nextRetryAt: new Date(Date.now() + retryDelay).toISOString()
+          });
+        }
+      }
     });
 
-    // Wait for all messages in this batch to complete
-    await Promise.all(promises);
+    // BATCH DATABASE UPDATES (major performance improvement)
+    const now = new Date().toISOString();
+
+    // Update 1: Mark sent messages
+    if (sentMessageIds.length > 0) {
+      await supabase
+        .from('send_queue')
+        .update({
+          status: 'sent',
+          sent_at: now
+        })
+        .in('id', sentMessageIds);
+
+      // Batch insert messages
+      await supabase.from('messages').insert(sentMessageData);
+
+      // Batch insert status logs
+      const statusLogs = sentMessageData.map(msg => ({
+        whatsapp_message_id: msg.whatsapp_message_id,
+        status: 'sent',
+        campaign_id: msg.campaign_id
+      }));
+      await supabase.from('message_status_logs').insert(statusLogs);
+
+      // Update campaign sent counter (bulk)
+      await supabase.rpc('increment_campaign_sent_bulk', {
+        _campaign_id: campaignId,
+        _count: sentMessageIds.length
+      }).catch(() => {
+        // Fallback: increment one by one if bulk function doesn't exist
+        sentMessageIds.forEach(async () => {
+          await supabase.rpc('increment_campaign_sent', { _campaign_id: campaignId });
+        });
+      });
+
+      console.log(`[Queue] ✅ Sent ${sentMessageIds.length} messages successfully`);
+    }
+
+    // Update 2: Mark spam-detected messages
+    if (spamDetectedMessages.length > 0) {
+      await supabase
+        .from('send_queue')
+        .update({ spam_error_detected: true })
+        .in('id', spamDetectedMessages);
+
+      // Check spam count and trigger auto-pause if needed
+      const { data: spamCount } = await supabase
+        .rpc('count_recent_spam_errors', {
+          p_campaign_id: campaignId,
+          p_minutes_ago: 10
+        });
+
+      const recentSpamErrors = spamCount || 0;
+      if (recentSpamErrors >= 30) {
+        console.log(`[Queue] 🚨 Spam threshold reached: ${recentSpamErrors} errors`);
+        await handleSpamAutoPause(campaignId, whatsappNumber.id);
+      }
+    }
+
+    // Update 3: Schedule retries
+    if (failedMessagesForRetry.length > 0) {
+      for (const retry of failedMessagesForRetry) {
+        await supabase
+          .from('send_queue')
+          .update({
+            status: 'ready',
+            error_message: retry.errorMessage,
+            retry_count: retry.retryCount,
+            next_retry_at: retry.nextRetryAt
+          })
+          .eq('id', retry.id);
+      }
+      console.log(`[Queue] 🔄 Scheduled ${failedMessagesForRetry.length} messages for retry`);
+    }
+
+    // Update 4: Mark permanently failed
+    if (permanentlyFailedMessages.length > 0) {
+      for (const failed of permanentlyFailedMessages) {
+        await supabase
+          .from('send_queue')
+          .update({
+            status: 'failed',
+            error_message: failed.errorMessage,
+            retry_count: 2
+          })
+          .eq('id', failed.id);
+      }
+
+      // Update campaign failed counter (bulk)
+      await supabase.rpc('increment_campaign_failed_bulk', {
+        _campaign_id: campaignId,
+        _count: permanentlyFailedMessages.length
+      }).catch(() => {
+        // Fallback: increment one by one
+        permanentlyFailedMessages.forEach(async () => {
+          await supabase.rpc('increment_campaign_failed', { _campaign_id: campaignId });
+        });
+      });
+
+      console.log(`[Queue] ❌ ${permanentlyFailedMessages.length} messages permanently failed`);
+    }
+
+    // Rate limiting: Wait between batches
+    const delayBetweenBatches = (CONCURRENT_REQUESTS / rateState.currentRate) * 1000;
+    await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
 
     rateState.isProcessing = false;
 
