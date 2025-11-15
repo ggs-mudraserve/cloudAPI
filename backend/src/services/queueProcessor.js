@@ -1,7 +1,7 @@
 const { supabase } = require('../config/supabase');
 const whatsappService = require('./whatsappService');
 const { sendTemplateMessage } = whatsappService;
-const pLimit = require('p-limit');
+const pLimit = require('p-limit').default || require('p-limit');
 const HttpsAgent = require('agentkeepalive').HttpsAgent;
 
 // HTTP Keep-Alive agent for optimal connection reuse
@@ -467,13 +467,17 @@ async function checkAndProgressTemplate(campaignId, currentTemplateIndex, totalT
  * Process queue for a specific campaign
  */
 async function processCampaignQueue(campaignId) {
+  let campaign = null; // Declare outside try block for catch access
+
   try {
     // Get campaign details
-    const { data: campaign, error: campaignError } = await supabase
+    const { data: campaignData, error: campaignError } = await supabase
       .from('campaigns')
-      .select('id, whatsapp_number_id, status, total_contacts, template_names')
+      .select('id, whatsapp_number_id, status, total_contacts, template_names, current_template_index')
       .eq('id', campaignId)
       .single();
+
+    campaign = campaignData;
 
     if (campaignError || !campaign) {
       console.error(`[Queue] Campaign ${campaignId} not found`);
@@ -820,15 +824,17 @@ async function processCampaignQueue(campaignId) {
       await supabase.from('message_status_logs').insert(statusLogs);
 
       // Update campaign sent counter (bulk)
-      await supabase.rpc('increment_campaign_sent_bulk', {
-        _campaign_id: campaignId,
-        _count: sentMessageIds.length
-      }).catch(() => {
-        // Fallback: increment one by one if bulk function doesn't exist
-        sentMessageIds.forEach(async () => {
-          await supabase.rpc('increment_campaign_sent', { _campaign_id: campaignId });
+      try {
+        await supabase.rpc('increment_campaign_sent_bulk', {
+          _campaign_id: campaignId,
+          _count: sentMessageIds.length
         });
-      });
+      } catch (bulkError) {
+        // Fallback: increment one by one if bulk function doesn't exist
+        for (let i = 0; i < sentMessageIds.length; i++) {
+          await supabase.rpc('increment_campaign_sent', { _campaign_id: campaignId });
+        }
+      }
 
       console.log(`[Queue] ✅ Sent ${sentMessageIds.length} messages successfully`);
     }
@@ -884,15 +890,17 @@ async function processCampaignQueue(campaignId) {
       }
 
       // Update campaign failed counter (bulk)
-      await supabase.rpc('increment_campaign_failed_bulk', {
-        _campaign_id: campaignId,
-        _count: permanentlyFailedMessages.length
-      }).catch(() => {
-        // Fallback: increment one by one
-        permanentlyFailedMessages.forEach(async () => {
-          await supabase.rpc('increment_campaign_failed', { _campaign_id: campaignId });
+      try {
+        await supabase.rpc('increment_campaign_failed_bulk', {
+          _campaign_id: campaignId,
+          _count: permanentlyFailedMessages.length
         });
-      });
+      } catch (bulkError) {
+        // Fallback: increment one by one
+        for (let i = 0; i < permanentlyFailedMessages.length; i++) {
+          await supabase.rpc('increment_campaign_failed', { _campaign_id: campaignId });
+        }
+      }
 
       console.log(`[Queue] ❌ ${permanentlyFailedMessages.length} messages permanently failed`);
     }
