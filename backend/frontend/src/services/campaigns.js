@@ -45,6 +45,12 @@ export const campaignsAPI = {
     return response.data;
   },
 
+  // Retry all failed messages in a campaign
+  retryFailed: async (id) => {
+    const response = await api.post(`/campaigns/${id}/retry-failed`);
+    return response.data;
+  },
+
   // Get campaign statistics
   getStats: async () => {
     const response = await api.get('/campaigns/stats');

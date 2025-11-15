@@ -344,6 +344,20 @@ const Campaigns = () => {
     }
   };
 
+  const handleRetryFailed = async (campaignId) => {
+    try {
+      const result = await campaignsAPI.retryFailed(campaignId);
+      setSuccessMessage(result.message || `${result.retriedCount} failed messages queued for retry`);
+      loadCampaigns();
+      if (selectedCampaign && selectedCampaign.id === campaignId) {
+        loadCampaignDetails(campaignId);
+      }
+    } catch (err) {
+      console.error('Retry failed messages error:', err);
+      setError(err.response?.data?.message || 'Failed to retry messages');
+    }
+  };
+
   const getStatusBadge = (status) => {
     const colors = {
       'scheduled': 'bg-blue-100 text-blue-800',
@@ -759,6 +773,14 @@ const Campaigns = () => {
                           className="inline-flex items-center px-3 py-2 border border-green-300 text-sm font-medium rounded-md text-green-700 bg-white hover:bg-green-50"
                         >
                           Resume
+                        </button>
+                      )}
+                      {(campaign.status === 'running' || campaign.status === 'completed' || campaign.status === 'paused') && campaign.total_failed > 0 && (
+                        <button
+                          onClick={() => handleRetryFailed(campaign.id)}
+                          className="inline-flex items-center px-3 py-2 border border-orange-300 text-sm font-medium rounded-md text-orange-700 bg-white hover:bg-orange-50"
+                        >
+                          Retry Failed ({campaign.total_failed})
                         </button>
                       )}
                       {(campaign.status === 'scheduled' || campaign.status === 'failed' || campaign.status === 'completed') && (
