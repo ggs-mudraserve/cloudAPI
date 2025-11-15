@@ -796,7 +796,7 @@ async function processCampaignQueue(campaignId) {
     });
 
     // BATCH DATABASE UPDATES (major performance improvement)
-    const now = new Date().toISOString();
+    const nowISO = new Date().toISOString();
 
     // Update 1: Mark sent messages
     if (sentMessageIds.length > 0) {
@@ -804,7 +804,7 @@ async function processCampaignQueue(campaignId) {
         .from('send_queue')
         .update({
           status: 'sent',
-          sent_at: now
+          sent_at: nowISO
         })
         .in('id', sentMessageIds);
 
