@@ -27,6 +27,62 @@ module.exports.keepaliveAgent = keepaliveAgent;
 // In-memory state for rate control (per WhatsApp number)
 const rateControlState = new Map();
 
+// In-memory counter cache for batched updates (per campaign)
+const counterCache = new Map();
+
+/**
+ * Initialize counter cache for a campaign
+ */
+function initCounterCache(campaignId) {
+  if (!counterCache.has(campaignId)) {
+    counterCache.set(campaignId, {
+      pendingSent: 0,
+      pendingFailed: 0,
+      batchesSinceLastUpdate: 0,
+      lastUpdateTime: Date.now()
+    });
+  }
+  return counterCache.get(campaignId);
+}
+
+/**
+ * Flush counter cache to database
+ * Called when: 1 minute elapsed OR 5 batches completed OR campaign ends
+ */
+async function flushCounterCache(campaignId, force = false) {
+  const cache = counterCache.get(campaignId);
+  if (!cache) return;
+
+  const timeSinceLastUpdate = Date.now() - cache.lastUpdateTime;
+  const shouldFlush = force ||
+                      timeSinceLastUpdate >= 60000 || // 1 minute
+                      cache.batchesSinceLastUpdate >= 5; // 5 batches
+
+  if (shouldFlush && (cache.pendingSent > 0 || cache.pendingFailed > 0)) {
+    console.log(`[Queue] Flushing counters for campaign ${campaignId}: +${cache.pendingSent} sent, +${cache.pendingFailed} failed`);
+
+    const { data: campaignData } = await supabase
+      .from('campaigns')
+      .select('total_sent, total_failed')
+      .eq('id', campaignId)
+      .single();
+
+    await supabase
+      .from('campaigns')
+      .update({
+        total_sent: (campaignData?.total_sent || 0) + cache.pendingSent,
+        total_failed: (campaignData?.total_failed || 0) + cache.pendingFailed
+      })
+      .eq('id', campaignId);
+
+    // Reset cache
+    cache.pendingSent = 0;
+    cache.pendingFailed = 0;
+    cache.batchesSinceLastUpdate = 0;
+    cache.lastUpdateTime = Date.now();
+  }
+}
+
 /**
  * Initialize rate control for a WhatsApp number
  */
@@ -163,6 +219,9 @@ async function handleSpamAutoPause(campaignId, whatsappNumberId) {
       // FIRST OCCURRENCE: Pause for 30 minutes, will auto-resume at 50% speed
       const pausedUntil = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes from now
 
+      // Force flush any remaining cached counters before pausing
+      await flushCounterCache(campaignId, true);
+
       await supabase
         .from('campaigns')
         .update({
@@ -210,6 +269,10 @@ async function handleSpamAutoPause(campaignId, whatsappNumberId) {
 
     } else if (newPauseCount >= 2) {
       // SECOND+ OCCURRENCE: Permanently pause, require manual resume
+
+      // Force flush any remaining cached counters before permanent pause
+      await flushCounterCache(campaignId, true);
+
       await supabase
         .from('campaigns')
         .update({
@@ -672,6 +735,9 @@ async function processCampaignQueue(campaignId) {
 
     console.log(`[Queue] Processing ${messages.length} messages for campaign ${campaignId} at ${rateState.currentRate} msg/sec`);
 
+    // Initialize counter cache for this campaign
+    const cache = initCounterCache(campaignId);
+
     // Get template map from cache (reuse cacheKey from above)
     const templateMap = templateCache.get(`${campaign.whatsapp_number_id}_templates`);
 
@@ -823,18 +889,8 @@ async function processCampaignQueue(campaignId) {
       }));
       await supabase.from('message_status_logs').insert(statusLogs);
 
-      // Update campaign sent counter (bulk)
-      try {
-        await supabase.rpc('increment_campaign_sent_bulk', {
-          _campaign_id: campaignId,
-          _count: sentMessageIds.length
-        });
-      } catch (bulkError) {
-        // Fallback: increment one by one if bulk function doesn't exist
-        for (let i = 0; i < sentMessageIds.length; i++) {
-          await supabase.rpc('increment_campaign_sent', { _campaign_id: campaignId });
-        }
-      }
+      // Update in-memory counter cache (will flush based on conditions)
+      cache.pendingSent += sentMessageIds.length;
 
       console.log(`[Queue] ✅ Sent ${sentMessageIds.length} messages successfully`);
     }
@@ -889,21 +945,15 @@ async function processCampaignQueue(campaignId) {
           .eq('id', failed.id);
       }
 
-      // Update campaign failed counter (bulk)
-      try {
-        await supabase.rpc('increment_campaign_failed_bulk', {
-          _campaign_id: campaignId,
-          _count: permanentlyFailedMessages.length
-        });
-      } catch (bulkError) {
-        // Fallback: increment one by one
-        for (let i = 0; i < permanentlyFailedMessages.length; i++) {
-          await supabase.rpc('increment_campaign_failed', { _campaign_id: campaignId });
-        }
-      }
+      // Update in-memory counter cache (will flush based on conditions)
+      cache.pendingFailed += permanentlyFailedMessages.length;
 
       console.log(`[Queue] ❌ ${permanentlyFailedMessages.length} messages permanently failed`);
     }
+
+    // Increment batch counter and conditionally flush to database
+    cache.batchesSinceLastUpdate++;
+    await flushCounterCache(campaignId);
 
     // Rate limiting: Wait between batches
     const delayBetweenBatches = (CONCURRENT_REQUESTS / rateState.currentRate) * 1000;
@@ -958,6 +1008,10 @@ async function processCampaignQueue(campaignId) {
 
         if (processedCount >= totalContacts || pendingCount === 0) {
           console.log(`[Queue] Marking campaign ${campaignId} as completed...`);
+
+          // Force flush any remaining cached counters before completion
+          await flushCounterCache(campaignId, true);
+
           const { error: updateError } = await supabase
             .from('campaigns')
             .update({
@@ -971,6 +1025,9 @@ async function processCampaignQueue(campaignId) {
             console.error(`[Queue] Error marking campaign as completed:`, updateError);
           } else {
             console.log(`[Queue] ✅ Campaign ${campaignId} completed successfully`);
+
+            // Clean up counter cache for completed campaign
+            counterCache.delete(campaignId);
           }
         } else {
           console.log(`[Queue] ⚠️  Campaign ${campaignId} has pending messages but none matched query. Will retry on next poll.`);
