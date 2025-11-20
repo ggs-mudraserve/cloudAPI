@@ -1,6 +1,6 @@
 const axios = require('axios');
 
-const WHATSAPP_API_BASE = 'https://graph.facebook.com/v18.0';
+const WHATSAPP_API_BASE = 'https://graph.facebook.com/v24.0';
 
 // HTTP Keep-Alive agent will be injected from queueProcessor
 let whatsappClient = axios.create({
@@ -99,20 +99,23 @@ async function sendTemplateMessage(phoneNumberId, accessToken, to, templateName,
       (headerComponent.format === 'VIDEO' || headerComponent.format === 'IMAGE' || headerComponent.format === 'DOCUMENT');
 
     if (hasMediaHeader && variableValues.length > 0) {
-      const mediaUrl = variableValues[currentVarIndex];
+      const mediaValue = variableValues[currentVarIndex];
       currentVarIndex++;
 
       let mediaType = 'video'; // Default
       if (headerComponent.format === 'IMAGE') mediaType = 'image';
       else if (headerComponent.format === 'DOCUMENT') mediaType = 'document';
 
+      // Auto-detect: Check if it's a URL or Media ID
+      const isUrl = String(mediaValue).startsWith('http://') || String(mediaValue).startsWith('https://');
+
       components.push({
         type: 'header',
         parameters: [{
           type: mediaType,
-          [mediaType]: {
-            link: String(mediaUrl)
-          }
+          [mediaType]: isUrl
+            ? { link: String(mediaValue) }      // Use link for URLs
+            : { id: String(mediaValue) }        // Use id for Media IDs
         }]
       });
     }
@@ -303,6 +306,56 @@ async function markMessageAsRead(phoneNumberId, accessToken, messageId) {
 }
 
 /**
+ * Upload media to WhatsApp Cloud API
+ * @param {string} phoneNumberId - WhatsApp Phone Number ID
+ * @param {string} accessToken - Access token
+ * @param {Buffer} fileBuffer - File buffer
+ * @param {string} mimeType - MIME type (e.g., 'video/mp4', 'image/jpeg')
+ * @param {string} fileName - Original file name
+ * @returns {Promise<object>} - { success, mediaId, error }
+ */
+async function uploadMedia(phoneNumberId, accessToken, fileBuffer, mimeType, fileName) {
+  try {
+    const FormData = require('form-data');
+    const cleanToken = accessToken.replace(/\s+/g, '').trim();
+    const cleanPhoneId = phoneNumberId.replace(/\s+/g, '').trim();
+
+    const form = new FormData();
+    form.append('file', fileBuffer, { filename: fileName });
+    form.append('type', mimeType);
+    form.append('messaging_product', 'whatsapp');
+
+    const response = await axios.post(
+      `${WHATSAPP_API_BASE}/${cleanPhoneId}/media`,
+      form,
+      {
+        headers: {
+          'Authorization': `Bearer ${cleanToken}`,
+          ...form.getHeaders()
+        },
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity
+      }
+    );
+
+    console.log('[WhatsApp] Media uploaded successfully:', response.data.id);
+
+    return {
+      success: true,
+      mediaId: response.data.id
+    };
+  } catch (error) {
+    console.error('WhatsApp upload media error:', error.response?.data || error.message);
+
+    return {
+      success: false,
+      error: error.response?.data?.error?.message || 'Failed to upload media',
+      errorCode: error.response?.data?.error?.code
+    };
+  }
+}
+
+/**
  * Get WhatsApp Business Profile info (display name and profile picture)
  */
 async function getBusinessProfile(phoneNumberId, accessToken, wabaId) {
@@ -364,5 +417,6 @@ module.exports = {
   fetchTemplates,
   markMessageAsRead,
   getBusinessProfile,
+  uploadMedia,
   setHttpAgent
 };

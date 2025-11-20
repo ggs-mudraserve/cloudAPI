@@ -278,16 +278,16 @@ async function enqueueMessages(campaignId, whatsappNumberId, distribution, templ
     for (const contact of contacts) {
       let payload = contact.variables;
 
-      // If template has media header, check if CSV already provides media URL
+      // If template has media header, check if CSV already provides media URL or Media ID
       if (hasMediaHeader) {
-        // Check if var1 from CSV is already a media URL
-        const csvHasMediaUrl = contact.variables.var1 &&
-          (String(contact.variables.var1).startsWith('http://') ||
-           String(contact.variables.var1).startsWith('https://'));
+        // Check if var1 from CSV is a media URL or Media ID
+        const var1Value = String(contact.variables.var1 || '');
+        const csvHasMediaUrl = var1Value.startsWith('http://') || var1Value.startsWith('https://');
+        const csvHasMediaId = var1Value.length > 0 && !csvHasMediaUrl; // Any non-URL value is treated as Media ID
 
-        if (csvHasMediaUrl) {
-          // CSV already has media URL in var1, use it as-is (no shifting needed)
-          console.log(`[Campaign] Using media URL from CSV for template ${templateName}`);
+        if (csvHasMediaUrl || csvHasMediaId) {
+          // CSV already has media (URL or ID) in var1, use it as-is (no shifting needed)
+          console.log(`[Campaign] Using media ${csvHasMediaUrl ? 'URL' : 'ID'} from CSV for template ${templateName}`);
           payload = contact.variables;
         } else {
           // CSV doesn't have media URL, try to inject from templateMediaUrls or template example
@@ -381,27 +381,24 @@ async function listCampaigns(filters = {}) {
 /**
  * Get single campaign with details
  */
-async function getCampaign(campaignId) {
-  const { calculateTemplateStats } = require('../utils/messageStatsCalculator');
+async function getCampaign(campaignId, includeTemplateStats = false) {
+  // PERFORMANCE OPTIMIZATION: Only fetch basic campaign data by default
+  // Template stats are expensive (125+ queries), so fetch only when requested
 
-  // Fetch campaign and template stats in parallel for better performance
-  const [campaignResult, templateStats] = await Promise.all([
-    supabase
-      .from('campaigns')
-      .select(`
-        *,
-        whatsapp_numbers (
-          id,
-          number,
-          display_name
-        )
-      `)
-      .eq('id', campaignId)
-      .single(),
-    calculateTemplateStats(campaignId)
-  ]);
+  const { data: campaignData, error: campaignError } = await supabase
+    .from('campaigns')
+    .select(`
+      *,
+      whatsapp_numbers (
+        id,
+        number,
+        display_name
+      )
+    `)
+    .eq('id', campaignId)
+    .single();
 
-  if (campaignResult.error) throw campaignResult.error;
+  if (campaignError) throw campaignError;
 
   // PERFORMANCE FIX: Use aggregation instead of fetching all campaign_contacts records
   // For large campaigns (50k+ contacts), this is much faster
@@ -443,11 +440,29 @@ async function getCampaign(campaignId) {
     });
   }
 
-  return {
-    ...campaignResult.data,
+  // Calculate message stats (delivered, read, replied) from message_status_logs
+  const { calculateMessageStats } = require('../utils/messageStatsCalculator');
+  const messageStats = await calculateMessageStats([campaignId]);
+
+  // Cap stats to total_sent to handle duplicate message scenarios
+  const totalSent = campaignData.total_sent || 0;
+
+  const result = {
+    ...campaignData,
     distribution,
-    templateStats
+    // Add message delivery statistics (capped to total_sent)
+    total_delivered: Math.min(messageStats.totalDelivered, totalSent),
+    total_read: Math.min(messageStats.totalRead, totalSent),
+    total_replied: messageStats.replied
   };
+
+  // Only include template stats if explicitly requested
+  if (includeTemplateStats) {
+    const { calculateTemplateStats } = require('../utils/messageStatsCalculator');
+    result.templateStats = await calculateTemplateStats(campaignId);
+  }
+
+  return result;
 }
 
 /**
@@ -513,10 +528,23 @@ async function resumeCampaign(campaignId) {
   return data;
 }
 
+/**
+ * Get template-level statistics for a campaign
+ */
+async function getTemplateStats(campaignId) {
+  const { calculateTemplateStats } = require('../utils/messageStatsCalculator');
+
+  // Call the existing calculateTemplateStats function
+  const templateStats = await calculateTemplateStats(campaignId);
+
+  return templateStats;
+}
+
 module.exports = {
   createCampaign,
   listCampaigns,
   getCampaign,
+  getTemplateStats,
   deleteCampaign,
   stopCampaign,
   resumeCampaign,

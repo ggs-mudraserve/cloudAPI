@@ -6,11 +6,11 @@ const HttpsAgent = require('agentkeepalive').HttpsAgent;
 
 // HTTP Keep-Alive agent for optimal connection reuse
 const keepaliveAgent = new HttpsAgent({
-  maxSockets: 100,           // Max concurrent connections
-  maxFreeSockets: 10,        // Max idle connections to keep
+  maxSockets: 200,           // Increased for higher concurrency
+  maxFreeSockets: 50,         // More idle connections
   timeout: 60000,            // Active socket timeout (60s)
   freeSocketTimeout: 30000,  // Idle socket timeout (30s)
-  socketActiveTTL: 60000     // Max socket lifetime (60s)
+  socketActiveTTL: 120000    // Increased socket lifetime (120s)
 });
 
 // Initialize the HTTP agent in whatsappService
@@ -20,8 +20,8 @@ whatsappService.setHttpAgent(keepaliveAgent);
 module.exports.keepaliveAgent = keepaliveAgent;
 
 /**
- * Queue Processor for Campaign Messages
- * Implements adaptive rate control and sequential execution per WhatsApp number
+ * High-Performance Queue Processor for Campaign Messages
+ * Optimized for sustained high-speed messaging (80-1000 msg/sec)
  */
 
 // In-memory state for rate control (per WhatsApp number)
@@ -29,6 +29,26 @@ const rateControlState = new Map();
 
 // In-memory counter cache for batched updates (per campaign)
 const counterCache = new Map();
+
+// Performance metrics tracking
+const performanceMetrics = new Map();
+
+/**
+ * Initialize performance metrics for a campaign
+ */
+function initPerformanceMetrics(campaignId) {
+  if (!performanceMetrics.has(campaignId)) {
+    performanceMetrics.set(campaignId, {
+      startTime: Date.now(),
+      totalSent: 0,
+      totalFailed: 0,
+      lastBatchTime: Date.now(),
+      avgBatchTime: 0,
+      batchCount: 0
+    });
+  }
+  return performanceMetrics.get(campaignId);
+}
 
 /**
  * Initialize counter cache for a campaign
@@ -47,7 +67,7 @@ function initCounterCache(campaignId) {
 
 /**
  * Flush counter cache to database
- * Called when: 1 minute elapsed OR 5 batches completed OR campaign ends
+ * Called when: 30 seconds elapsed OR 10 batches completed OR campaign ends
  */
 async function flushCounterCache(campaignId, force = false) {
   const cache = counterCache.get(campaignId);
@@ -55,23 +75,66 @@ async function flushCounterCache(campaignId, force = false) {
 
   const timeSinceLastUpdate = Date.now() - cache.lastUpdateTime;
   const shouldFlush = force ||
-                      timeSinceLastUpdate >= 60000 || // 1 minute
-                      cache.batchesSinceLastUpdate >= 5; // 5 batches
+                      timeSinceLastUpdate >= 30000 || // 30 seconds (reduced from 60)
+                      cache.batchesSinceLastUpdate >= 10; // 10 batches
 
-  if (shouldFlush && (cache.pendingSent > 0 || cache.pendingFailed > 0)) {
-    console.log(`[Queue] Flushing counters for campaign ${campaignId}: +${cache.pendingSent} sent, +${cache.pendingFailed} failed`);
+  if (shouldFlush) {
+    // CRITICAL FIX: Calculate accurate counts directly from send_queue
+    // This ensures we count unique contacts, not duplicate send attempts
+    const { data: queueStats, error: statsError } = await supabase
+      .from('send_queue')
+      .select('status')
+      .eq('campaign_id', campaignId);
 
-    const { data: campaignData } = await supabase
-      .from('campaigns')
-      .select('total_sent, total_failed')
-      .eq('id', campaignId)
-      .single();
+    if (statsError) {
+      console.error(`[Queue] Error fetching queue stats:`, statsError);
+      return;
+    }
 
+    // Count by status
+    const sentCount = queueStats.filter(q => q.status === 'sent').length;
+    const failedCount = queueStats.filter(q => q.status === 'failed').length;
+
+    // Calculate delivered/read/replied stats for realtime updates
+    const [deliveredResult, readResult, repliedResult] = await Promise.all([
+      // Count delivered (status = 'delivered' OR 'read')
+      supabase
+        .from('message_status_logs')
+        .select('whatsapp_message_id', { count: 'exact', head: true })
+        .eq('campaign_id', campaignId)
+        .in('status', ['delivered', 'read']),
+
+      // Count read (status = 'read')
+      supabase
+        .from('message_status_logs')
+        .select('whatsapp_message_id', { count: 'exact', head: true })
+        .eq('campaign_id', campaignId)
+        .eq('status', 'read'),
+
+      // Count replied (unique users who sent incoming messages)
+      supabase.rpc('count_campaign_replies', { p_campaign_id: campaignId })
+    ]);
+
+    const deliveredCount = deliveredResult.count || 0;
+    const readCount = readResult.count || 0;
+    let repliedCount = 0;
+
+    // Handle RPC result (may not exist in older databases)
+    if (!repliedResult.error && repliedResult.data !== null) {
+      repliedCount = repliedResult.data;
+    }
+
+    console.log(`[Queue] Flushing accurate counters: ${sentCount} sent, ${failedCount} failed, ${deliveredCount} delivered, ${readCount} read, ${repliedCount} replied`);
+
+    // Update campaign with accurate counts
     await supabase
       .from('campaigns')
       .update({
-        total_sent: (campaignData?.total_sent || 0) + cache.pendingSent,
-        total_failed: (campaignData?.total_failed || 0) + cache.pendingFailed
+        total_sent: sentCount,
+        total_failed: failedCount,
+        total_delivered: deliveredCount,
+        total_read: readCount,
+        total_replied: repliedCount
       })
       .eq('id', campaignId);
 
@@ -89,42 +152,57 @@ async function flushCounterCache(campaignId, force = false) {
 function initRateControl(whatsappNumberId, initialRate) {
   if (!rateControlState.has(whatsappNumberId)) {
     rateControlState.set(whatsappNumberId, {
-      currentRate: initialRate || 60, // Start at 60 msg/sec
+      currentRate: initialRate || 80, // Start at 80 msg/sec (WhatsApp default)
       errorCount: 0,
       consecutiveErrorCount: 0,
       lastErrorTime: null,
       successWindow: [], // Track last 5 minutes of successes
+      errorWindow: [],   // Track last 5 minutes of errors
       isProcessing: false,
-      lastUpdateTime: Date.now()
+      lastUpdateTime: Date.now(),
+      totalMessagesSent: 0,
+      lastRateIncrease: Date.now()
     });
   }
   return rateControlState.get(whatsappNumberId);
 }
 
 /**
- * Get delay in milliseconds based on current rate
+ * Calculate current throughput
  */
-function getDelay(messagesPerSecond) {
-  return Math.ceil(1000 / messagesPerSecond);
+function calculateThroughput(rateState) {
+  const now = Date.now();
+  const windowSize = 60000; // 1 minute window
+
+  // Clean old entries
+  rateState.successWindow = rateState.successWindow.filter(t => now - t <= windowSize);
+
+  // Calculate messages per second in the last minute
+  const messagesInWindow = rateState.successWindow.length;
+  const actualRate = messagesInWindow / 60;
+
+  return actualRate;
 }
 
 /**
- * Adjust rate based on error/success patterns
+ * Adjust rate based on error/success patterns - More aggressive scaling
  */
-async function adjustRate(whatsappNumberId, rateState, errorCode = null, maxLimit = 200) {
+async function adjustRate(whatsappNumberId, rateState, errorCode = null, maxLimit = 1000) {
   const now = Date.now();
 
-  if (errorCode === 130429) {
-    // WhatsApp rate limit error (429)
+  if (errorCode === 130429 || errorCode === 80007) {
+    // WhatsApp rate limit errors
     rateState.consecutiveErrorCount++;
+    rateState.errorWindow.push(now);
 
-    if (rateState.consecutiveErrorCount >= 3) {
-      // Decrease rate by 20% after 3 consecutive 429 errors
-      const newRate = Math.max(10, Math.floor(rateState.currentRate * 0.8));
-      console.log(`[Rate Control] Decreasing rate for number ${whatsappNumberId}: ${rateState.currentRate} -> ${newRate} msg/sec`);
+    if (rateState.consecutiveErrorCount >= 2) { // Reduced from 3 for faster response
+      // Decrease rate by 30% after 2 consecutive rate limit errors
+      const newRate = Math.max(10, Math.floor(rateState.currentRate * 0.7));
+      console.log(`[Rate Control] Rate limit hit! Decreasing rate for ${whatsappNumberId}: ${rateState.currentRate} -> ${newRate} msg/sec`);
 
       rateState.currentRate = newRate;
       rateState.consecutiveErrorCount = 0;
+      rateState.lastRateIncrease = now; // Reset increase timer
 
       // Persist to database
       await supabase
@@ -139,81 +217,77 @@ async function adjustRate(whatsappNumberId, rateState, errorCode = null, maxLimi
     // Success
     rateState.consecutiveErrorCount = 0;
     rateState.successWindow.push(now);
+    rateState.totalMessagesSent++;
 
-    // Keep only last 5 minutes of successes
-    rateState.successWindow = rateState.successWindow.filter(
-      time => now - time <= 5 * 60 * 1000
-    );
+    // Keep only last 5 minutes of data
+    const fiveMinutesAgo = now - 5 * 60 * 1000;
+    rateState.successWindow = rateState.successWindow.filter(t => t > fiveMinutesAgo);
+    rateState.errorWindow = rateState.errorWindow.filter(t => t > fiveMinutesAgo);
 
-    // Calculate error rate in last 5 minutes
-    const recentErrors = rateState.successWindow.filter(time => {
-      // This is simplified - in production you'd track errors separately
-      return false;
-    }).length;
+    // Calculate error rate
+    const totalRecent = rateState.successWindow.length + rateState.errorWindow.length;
+    const errorRate = totalRecent > 0 ? rateState.errorWindow.length / totalRecent : 0;
 
-    const totalRecent = rateState.successWindow.length;
-    const errorRate = totalRecent > 0 ? recentErrors / totalRecent : 0;
+    // More aggressive rate increase - 25% if error rate < 1% for 30 seconds
+    // And we haven't increased in the last 30 seconds
+    const timeSinceLastIncrease = now - rateState.lastRateIncrease;
 
-    // Increase rate by 15% if error rate < 1% for 1 minute and we have enough samples
-    // Cap at max_limit from database (configurable per WhatsApp number)
-    if (errorRate < 0.01 && totalRecent >= 60 && now - rateState.lastUpdateTime >= 1 * 60 * 1000) {
-      const newRate = Math.min(maxLimit, Math.floor(rateState.currentRate * 1.15));
-      console.log(`[Rate Control] Increasing rate for number ${whatsappNumberId}: ${rateState.currentRate} -> ${newRate} msg/sec (max: ${maxLimit})`);
+    if (errorRate < 0.01 &&
+        totalRecent >= 30 &&
+        timeSinceLastIncrease >= 30000 &&
+        rateState.currentRate < maxLimit) {
 
-      rateState.currentRate = newRate;
-      rateState.lastUpdateTime = now;
+      const currentThroughput = calculateThroughput(rateState);
 
-      // Persist to database
-      await supabase
-        .from('whatsapp_numbers')
-        .update({
-          max_send_rate_per_sec: newRate,
-          last_stable_rate_per_sec: newRate,
-          last_updated: new Date().toISOString()
-        })
-        .eq('id', whatsappNumberId);
+      // Only increase if we're actually achieving close to our target rate
+      if (currentThroughput >= rateState.currentRate * 0.8) {
+        const newRate = Math.min(maxLimit, Math.floor(rateState.currentRate * 1.25));
+        console.log(`[Rate Control] Excellent performance! Increasing rate for ${whatsappNumberId}: ${rateState.currentRate} -> ${newRate} msg/sec (actual: ${currentThroughput.toFixed(1)} msg/sec)`);
+
+        rateState.currentRate = newRate;
+        rateState.lastUpdateTime = now;
+        rateState.lastRateIncrease = now;
+
+        // Persist to database
+        await supabase
+          .from('whatsapp_numbers')
+          .update({
+            max_send_rate_per_sec: newRate,
+            last_stable_rate_per_sec: newRate,
+            last_updated: new Date().toISOString()
+          })
+          .eq('id', whatsappNumberId);
+      }
     }
   } else {
     // Other error types
     rateState.errorCount++;
+    rateState.errorWindow.push(now);
   }
 }
 
-// Retry logic removed - all failures are permanent
-// Users can manually retry failed messages via "Retry Failed" button
-
 /**
  * Handle automatic campaign pause due to spam detection (error 131048)
- *
- * Requirements:
- * - 1st occurrence (30 errors): Pause for 30 minutes, resume at 50% speed
- * - 2nd occurrence: Permanently pause, require manual resume
  */
 async function handleSpamAutoPause(campaignId, whatsappNumberId) {
   try {
-    // Get campaign's current spam pause count
-    const { data: campaign, error: campaignError } = await supabase
+    const { data: campaign } = await supabase
       .from('campaigns')
       .select('spam_pause_count, name')
       .eq('id', campaignId)
       .single();
 
-    if (campaignError || !campaign) {
-      console.error(`[Queue] Error fetching campaign for spam pause:`, campaignError);
-      return;
-    }
+    if (!campaign) return;
 
     const currentPauseCount = campaign.spam_pause_count || 0;
     const newPauseCount = currentPauseCount + 1;
 
-    console.log(`[Queue] 🚨 SPAM AUTO-PAUSE TRIGGERED for campaign "${campaign.name}"`);
-    console.log(`[Queue] This is occurrence #${newPauseCount}`);
+    console.log(`[Queue] 🚨 SPAM AUTO-PAUSE TRIGGERED for campaign "${campaign.name}" (occurrence #${newPauseCount})`);
 
     if (newPauseCount === 1) {
-      // FIRST OCCURRENCE: Pause for 30 minutes, will auto-resume at 50% speed
-      const pausedUntil = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes from now
+      // First occurrence: Pause for 30 minutes
+      const pausedUntil = new Date(Date.now() + 30 * 60 * 1000);
 
-      // Force flush any remaining cached counters before pausing
       await flushCounterCache(campaignId, true);
 
       await supabase
@@ -222,11 +296,11 @@ async function handleSpamAutoPause(campaignId, whatsappNumberId) {
           status: 'paused',
           spam_pause_count: newPauseCount,
           spam_paused_until: pausedUntil.toISOString(),
-          pause_reason: `Spam filter detected (error 131048). Auto-resuming at 50% speed in 30 minutes at ${pausedUntil.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST.`
+          pause_reason: `Spam filter detected. Auto-resuming at 50% speed at ${pausedUntil.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST.`
         })
         .eq('id', campaignId);
 
-      // Reduce send rate to 50%
+      // Reduce rate by 50%
       const { data: whatsappNumber } = await supabase
         .from('whatsapp_numbers')
         .select('max_send_rate_per_sec')
@@ -241,30 +315,10 @@ async function handleSpamAutoPause(campaignId, whatsappNumberId) {
         .update({ max_send_rate_per_sec: newRate })
         .eq('id', whatsappNumberId);
 
-      console.log(`[Queue] ⏸️  Campaign paused for 30 minutes`);
-      console.log(`[Queue] 📉 Send rate reduced: ${currentRate} → ${newRate} msg/sec`);
-      console.log(`[Queue] ⏰ Will auto-resume at: ${pausedUntil.toISOString()}`);
+      console.log(`[Queue] Campaign paused for 30 minutes, rate reduced to ${newRate} msg/sec`);
 
-      // Create notification
-      await supabase
-        .from('notifications')
-        .insert({
-          type: 'campaign_spam_pause',
-          title: `Campaign "${campaign.name}" auto-paused`,
-          message: `Spam filter detected (30+ error 131048). Paused for 30 minutes, will resume at 50% speed.`,
-          severity: 'high',
-          data: {
-            campaign_id: campaignId,
-            pause_count: newPauseCount,
-            resume_at: pausedUntil.toISOString(),
-            new_rate: newRate
-          }
-        });
-
-    } else if (newPauseCount >= 2) {
-      // SECOND+ OCCURRENCE: Permanently pause, require manual resume
-
-      // Force flush any remaining cached counters before permanent pause
+    } else {
+      // Second+ occurrence: Permanent pause
       await flushCounterCache(campaignId, true);
 
       await supabase
@@ -272,28 +326,12 @@ async function handleSpamAutoPause(campaignId, whatsappNumberId) {
         .update({
           status: 'paused',
           spam_pause_count: newPauseCount,
-          spam_paused_until: null, // No auto-resume
-          pause_reason: `Spam filter detected again (error 131048). Campaign permanently paused. Manual resume required. Please review template content and WhatsApp Business Manager quality score.`
+          spam_paused_until: null,
+          pause_reason: `Spam filter detected again. Manual resume required.`
         })
         .eq('id', campaignId);
 
-      console.log(`[Queue] 🛑 Campaign PERMANENTLY PAUSED (occurrence #${newPauseCount})`);
-      console.log(`[Queue] ⚠️  Manual resume required!`);
-
-      // Create high-severity notification
-      await supabase
-        .from('notifications')
-        .insert({
-          type: 'campaign_spam_permanent_pause',
-          title: `Campaign "${campaign.name}" PERMANENTLY PAUSED`,
-          message: `Spam filter triggered again (30+ error 131048). Manual review and resume required.`,
-          severity: 'critical',
-          data: {
-            campaign_id: campaignId,
-            pause_count: newPauseCount,
-            action_required: 'Review template content, check WhatsApp Business Manager quality score, then manually resume campaign'
-          }
-        });
+      console.log(`[Queue] Campaign PERMANENTLY PAUSED - manual intervention required`);
     }
 
   } catch (error) {
@@ -302,234 +340,17 @@ async function handleSpamAutoPause(campaignId, whatsappNumberId) {
 }
 
 /**
- * Process a single message from the queue
- */
-async function processMessage(message, whatsappNumber, rateState, templateMap) {
-  try {
-    // Get template from cache
-    const template = templateMap ? templateMap[message.template_name] : null;
-
-    if (!template) {
-      throw new Error(`Template ${message.template_name} not found in cache`);
-    }
-
-    // Update status to processing
-    await supabase
-      .from('send_queue')
-      .update({ status: 'processing' })
-      .eq('id', message.id);
-
-    // Send message via WhatsApp API
-    const result = await sendTemplateMessage(
-      whatsappNumber.phone_number_id,
-      whatsappNumber.access_token,
-      message.phone,
-      message.template_name,
-      template.language,
-      message.payload,
-      template.components
-    );
-
-    if (result.success) {
-      // Insert message record into messages table
-      const { error: messageError } = await supabase
-        .from('messages')
-        .insert({
-          whatsapp_number_id: message.whatsapp_number_id,
-          whatsapp_message_id: result.messageId,
-          user_phone: message.phone,
-          direction: 'outgoing',
-          message_type: 'template',
-          campaign_id: message.campaign_id,
-          template_name: message.template_name,
-          status: 'sent'
-        });
-
-      if (messageError) {
-        console.error(`[Queue] Failed to insert message record:`, messageError);
-        // Continue anyway - message was sent successfully
-      }
-
-      // Insert initial status log
-      const { error: statusLogError } = await supabase
-        .from('message_status_logs')
-        .insert({
-          whatsapp_message_id: result.messageId,
-          status: 'sent',
-          campaign_id: message.campaign_id
-        });
-
-      if (statusLogError) {
-        console.error(`[Queue] Failed to insert status log for message ${result.messageId}:`, statusLogError.message);
-        // Continue anyway - message was sent successfully
-      }
-
-      // Mark as sent in queue
-      await supabase
-        .from('send_queue')
-        .update({
-          status: 'sent',
-          sent_at: new Date().toISOString(),
-          whatsapp_message_id: result.messageId
-        })
-        .eq('id', message.id);
-
-      // Update campaign counter
-      await supabase.rpc('increment_campaign_sent', {
-        _campaign_id: message.campaign_id
-      });
-
-      // Adjust rate (success)
-      await adjustRate(message.whatsapp_number_id, rateState, null, whatsappNumber.max_limit || 200);
-
-      console.log(`[Queue] Sent message ${message.id} to ${message.phone}`);
-      return { success: true };
-
-    } else {
-      throw new Error(result.error || 'Failed to send message');
-    }
-
-  } catch (error) {
-    console.error(`[Queue] Error processing message ${message.id}:`, error);
-
-    // Check if it's a rate limit error
-    const errorCode = error.response?.data?.error?.code;
-
-    // SPAM DETECTION: Check for error 131048
-    if (errorCode === 131048) {
-      console.warn(`[Queue] ⚠️  SPAM ERROR 131048 detected for campaign ${message.campaign_id}, template ${message.template_name}`);
-
-      // Mark this message as spam-blocked
-      await supabase
-        .from('send_queue')
-        .update({ spam_error_detected: true })
-        .eq('id', message.id);
-
-      // Check spam error count for this campaign (last 10 minutes)
-      const { data: spamCount } = await supabase
-        .rpc('count_recent_spam_errors', {
-          p_campaign_id: message.campaign_id,
-          p_minutes_ago: 10
-        });
-
-      const recentSpamErrors = spamCount || 0;
-      console.log(`[Queue] Campaign ${message.campaign_id} has ${recentSpamErrors} spam errors in last 10 minutes`);
-
-      // TRIGGER AUTO-PAUSE if >= 30 spam errors
-      if (recentSpamErrors >= 30) {
-        await handleSpamAutoPause(message.campaign_id, message.whatsapp_number_id);
-      }
-    } else if (errorCode === 130429) {
-      await adjustRate(message.whatsapp_number_id, rateState, 130429, whatsappNumber.max_limit || 200);
-    } else {
-      await adjustRate(message.whatsapp_number_id, rateState, 'other', whatsappNumber.max_limit || 200);
-    }
-
-    // Handle retry logic (max 2 retries)
-    const newRetryCount = message.retry_count + 1;
-
-    if (newRetryCount >= 2) {
-      // Max retries reached (2 attempts), mark as failed
-      await supabase
-        .from('send_queue')
-        .update({
-          status: 'failed',
-          error_message: error.message,
-          retry_count: newRetryCount
-        })
-        .eq('id', message.id);
-
-      // Update campaign counter
-      await supabase.rpc('increment_campaign_failed', {
-        _campaign_id: message.campaign_id
-      });
-
-      console.log(`[Queue] Message ${message.id} failed after ${newRetryCount + 1} attempts (1 initial + ${newRetryCount} retries)`);
-      return { success: false, error: error.message };
-
-    } else {
-      // Schedule retry (will be retry 1 or 2)
-      const retryDelay = getRetryDelay(newRetryCount);
-      const nextRetryAt = new Date(Date.now() + retryDelay).toISOString();
-
-      await supabase
-        .from('send_queue')
-        .update({
-          status: 'ready',
-          error_message: error.message,
-          retry_count: newRetryCount,
-          next_retry_at: nextRetryAt
-        })
-        .eq('id', message.id);
-
-      console.log(`[Queue] Message ${message.id} scheduled for retry ${newRetryCount}/2 in ${retryDelay}ms`);
-      return { success: false, retry: true };
-    }
-  }
-}
-
-// Template cache per campaign
-const templateCache = new Map();
-
-// Campaign configuration cache (to avoid repeated DB queries)
-const campaignConfigCache = new Map();
-
-/**
- * Check if current template's first-attempts are complete and progress to next template
- */
-async function checkAndProgressTemplate(campaignId, currentTemplateIndex, totalTemplates) {
-  try {
-    // Count remaining messages for current template
-    const { count: remainingMessages } = await supabase
-      .from('send_queue')
-      .select('*', { count: 'exact', head: true })
-      .eq('campaign_id', campaignId)
-      .eq('template_order', currentTemplateIndex)
-      .in('status', ['ready', 'processing']);
-
-    if (remainingMessages === 0) {
-      // All messages done for this template, move to next
-      let nextTemplateIndex = currentTemplateIndex + 1;
-
-      // Skip templates with no messages (edge case)
-      while (nextTemplateIndex < totalTemplates) {
-        const { count: nextTemplateMessageCount } = await supabase
-          .from('send_queue')
-          .select('*', { count: 'exact', head: true })
-          .eq('campaign_id', campaignId)
-          .eq('template_order', nextTemplateIndex);
-
-        if (nextTemplateMessageCount > 0) break;
-        nextTemplateIndex++;
-      }
-
-      if (nextTemplateIndex < totalTemplates) {
-        console.log(`[Queue] ✅ Template ${currentTemplateIndex} complete. Moving to template ${nextTemplateIndex}`);
-
-        await supabase
-          .from('campaigns')
-          .update({ current_template_index: nextTemplateIndex })
-          .eq('id', campaignId);
-      } else {
-        console.log(`[Queue] ✅ All templates complete.`);
-      }
-    }
-  } catch (error) {
-    console.error(`[Queue] Error in checkAndProgressTemplate:`, error);
-  }
-}
-
-/**
- * Process queue for a specific campaign
+ * Process campaign queue with high-performance batching
  */
 async function processCampaignQueue(campaignId) {
-  let campaign = null; // Declare outside try block for catch access
+  let campaign = null;
+  let rateState = null; // Declare at function scope
 
   try {
     // Get campaign details
     const { data: campaignData, error: campaignError } = await supabase
       .from('campaigns')
-      .select('id, whatsapp_number_id, status, total_contacts, template_names, current_template_index')
+      .select('*')
       .eq('id', campaignId)
       .single();
 
@@ -546,437 +367,482 @@ async function processCampaignQueue(campaignId) {
     }
 
     // Get WhatsApp number details
-    const { data: whatsappNumber, error: numberError} = await supabase
+    const { data: whatsappNumber, error: numberError } = await supabase
       .from('whatsapp_numbers')
-      .select('id, phone_number_id, access_token, max_send_rate_per_sec, max_limit, is_active')
+      .select('*')
       .eq('id', campaign.whatsapp_number_id)
       .single();
 
-    if (numberError || !whatsappNumber) {
-      // FIXED: Don't fail campaign on transient database errors - just skip this cycle and retry
-      console.warn(`[Queue] Temporary error fetching WhatsApp number for campaign ${campaignId}:`, numberError?.message || 'Number not found');
-      console.log(`[Queue] Will retry on next poll cycle...`);
-      return;
-    }
-
-    if (!whatsappNumber.is_active) {
-      console.error(`[Queue] WhatsApp number is inactive for campaign ${campaignId}`);
-
-      // Mark campaign as failed only if number is genuinely inactive
-      await supabase
-        .from('campaigns')
-        .update({
-          status: 'failed',
-          end_time: new Date().toISOString()
-        })
-        .eq('id', campaignId);
-
-      return;
-    }
-
-    // Pre-fetch templates for this campaign (cache them)
-    const cacheKey = `${campaign.whatsapp_number_id}_templates`;
-    if (!templateCache.has(cacheKey)) {
-      const { data: templates, error: templateError } = await supabase
-        .from('templates')
-        .select('name, components, language')
-        .eq('whatsapp_number_id', campaign.whatsapp_number_id)
-        .in('name', campaign.template_names);
-
-      if (!templateError && templates) {
-        const templateMap = {};
-        templates.forEach(t => {
-          templateMap[t.name] = { components: t.components, language: t.language };
-        });
-        templateCache.set(cacheKey, templateMap);
-        console.log(`[Queue] Cached ${templates.length} template(s) for campaign ${campaignId}`);
-      }
-    }
-
-    // Initialize rate control
-    // Cap initial rate to max_limit to ensure we never exceed configured limit
-    const maxLimit = whatsappNumber.max_limit || 200;
-    const initialRate = Math.min(maxLimit, whatsappNumber.max_send_rate_per_sec || 60);
-    const rateState = initRateControl(
-      whatsappNumber.id,
-      initialRate
-    );
-
-    // Check if already processing
-    if (rateState.isProcessing) {
-      return; // Silently skip, don't log spam
-    }
-
-    rateState.isProcessing = true;
-
-    // SEQUENTIAL TEMPLATE PROCESSING: Get current template index
-    const currentTemplateIndex = campaign.current_template_index || 0;
-    const totalTemplates = campaign.template_names?.length || 0;
-
-    console.log(`[Queue] Campaign template progress: ${currentTemplateIndex + 1}/${totalTemplates} (template order ${currentTemplateIndex})`);
-
-    const now = new Date();
-
-    // Fetch ready messages for CURRENT template only (sequential processing)
-    const { data: messages, error: fetchError } = await supabase
-      .from('send_queue')
-      .select('*')
-      .eq('campaign_id', campaignId)
-      .eq('status', 'ready')
-      .eq('template_order', currentTemplateIndex)
-      .order('created_at', { ascending: true })
-      .limit(70); // Batch size
-
-    if (fetchError) {
-      console.error(`[Queue] Error fetching messages:`, fetchError);
-      rateState.isProcessing = false;
-      return;
-    }
-
-    console.log(`[Queue] Fetched ${messages?.length || 0} messages for template ${currentTemplateIndex}`);
-
-    if (!messages || messages.length === 0) {
-      // Check if current template's first-attempts are complete
-      if (currentTemplateIndex < totalTemplates) {
-        await checkAndProgressTemplate(campaignId, currentTemplateIndex, totalTemplates);
-      }
-      console.log(`[Queue] No messages to process for campaign ${campaignId}`);
-
-      // Check if campaign is complete
-      // FIXED: Added comprehensive check to prevent premature completion
-      const { data: stats, error: statsError, count: pendingCount } = await supabase
-        .from('send_queue')
-        .select('status', { count: 'exact' })
-        .eq('campaign_id', campaignId)
-        .in('status', ['ready', 'processing']);
-
-      console.log(`[Queue] Pending messages check: ${pendingCount || 0} messages with status ready/processing`);
-
-      if (statsError) {
-        console.error(`[Queue] Error checking pending messages:`, statsError);
-        rateState.isProcessing = false;
-        return;
-      }
-
-      // Only mark complete if TRULY no pending messages
-      // Extra safety: also check total vs sent+failed counts
-      if (pendingCount === 0) {
-        const { data: campaign } = await supabase
+    if (numberError || !whatsappNumber || !whatsappNumber.is_active) {
+      console.error(`[Queue] WhatsApp number issue for campaign ${campaignId}`);
+      if (!whatsappNumber?.is_active) {
+        await supabase
           .from('campaigns')
-          .select('total_contacts, total_sent, total_failed')
-          .eq('id', campaignId)
-          .single();
-
-        const processedCount = (campaign?.total_sent || 0) + (campaign?.total_failed || 0);
-        const totalContacts = campaign?.total_contacts || 0;
-
-        console.log(`[Queue] Campaign progress: ${processedCount}/${totalContacts} messages processed`);
-
-        // Verify counts match before marking complete
-        if (processedCount >= totalContacts || pendingCount === 0) {
-          console.log(`[Queue] Marking campaign ${campaignId} as completed...`);
-          const { error: updateError } = await supabase
-            .from('campaigns')
-            .update({
-              status: 'completed',
-              end_time: new Date().toISOString()
-            })
-            .eq('id', campaignId)
-            .eq('status', 'running'); // Only update if still running (prevent double-completion)
-
-          if (updateError) {
-            console.error(`[Queue] Error marking campaign as completed:`, updateError);
-          } else {
-            console.log(`[Queue] ✅ Campaign ${campaignId} completed successfully`);
-          }
-        } else {
-          console.log(`[Queue] ⚠️  Campaign ${campaignId} has pending messages but none matched query. Will retry on next poll.`);
-        }
+          .update({ status: 'failed', end_time: new Date().toISOString() })
+          .eq('id', campaignId);
       }
-
-      rateState.isProcessing = false;
       return;
     }
 
-    console.log(`[Queue] Processing ${messages.length} messages for campaign ${campaignId} at ${rateState.currentRate} msg/sec`);
+    // Initialize rate control with higher default
+    const maxLimit = whatsappNumber.max_limit || 1000;
+    const initialRate = Math.min(maxLimit, whatsappNumber.max_send_rate_per_sec || 80);
+    rateState = initRateControl(whatsappNumber.id, initialRate); // Now properly initialized
 
-    // Initialize counter cache for this campaign
+    // Note: isProcessing flag is already set by the caller (processQueue)
+    // We just need to ensure rateState reference is stored for cleanup
+
+    // Initialize metrics
+    const metrics = initPerformanceMetrics(campaignId);
     const cache = initCounterCache(campaignId);
 
-    // Get template map from cache (reuse cacheKey from above)
-    const templateMap = templateCache.get(`${campaign.whatsapp_number_id}_templates`);
+    // Pre-fetch all templates for caching
+    const cacheKey = `${campaign.whatsapp_number_id}_templates`;
+    let templateMap = {};
 
-    // OPTIMIZED PARALLEL PROCESSING with p-limit
-    const CONCURRENT_REQUESTS = 10; // Send 10 messages in parallel
-    const limit = pLimit(CONCURRENT_REQUESTS);
+    const { data: templates } = await supabase
+      .from('templates')
+      .select('name, components, language')
+      .eq('whatsapp_number_id', campaign.whatsapp_number_id)
+      .in('name', campaign.template_names || []);
 
-    // Create tasks with concurrency control
-    const sendTasks = messages.map(message =>
-      limit(async () => {
-        try {
-          // Update status to processing
-          await supabase
-            .from('send_queue')
-            .update({ status: 'processing' })
-            .eq('id', message.id);
-
-          // Get template from cache
-          const template = templateMap ? templateMap[message.template_name] : null;
-          if (!template) {
-            throw new Error(`Template ${message.template_name} not found in cache`);
-          }
-
-          // Send message via WhatsApp API (will use keep-alive agent)
-          const result = await sendTemplateMessage(
-            whatsappNumber.phone_number_id,
-            whatsappNumber.access_token,
-            message.phone,
-            message.template_name,
-            template.language,
-            message.payload,
-            template.components
-          );
-
-          if (result.success) {
-            // Adjust rate (success)
-            await adjustRate(message.whatsapp_number_id, rateState, null, whatsappNumber.max_limit || 80);
-            return {
-              success: true,
-              messageId: message.id,
-              whatsappMessageId: result.messageId,
-              phone: message.phone,
-              campaignId: message.campaign_id
-            };
-          } else {
-            throw new Error(result.error || 'Failed to send message');
-          }
-        } catch (error) {
-          // Check error code for rate limiting and spam detection
-          const errorCode = error.response?.data?.error?.code;
-
-          // SPAM DETECTION: Check for error 131048
-          if (errorCode === 131048) {
-            console.warn(`[Queue] ⚠️  SPAM ERROR 131048 detected for message ${message.id}`);
-            // Mark as spam-detected for later handling
-          } else if (errorCode === 130429) {
-            await adjustRate(message.whatsapp_number_id, rateState, 130429, whatsappNumber.max_limit || 80);
-          } else {
-            await adjustRate(message.whatsapp_number_id, rateState, 'other', whatsappNumber.max_limit || 80);
-          }
-
-          return {
-            success: false,
-            messageId: message.id,
-            errorMessage: error.message,
-            errorCode: errorCode,
-            retryCount: message.retry_count
-          };
-        }
-      })
-    );
-
-    // Execute all tasks with concurrency control and get results
-    const results = await Promise.allSettled(sendTasks);
-
-    // Process results and prepare batch updates
-    const sentMessageIds = [];
-    const sentMessageData = [];
-    const permanentlyFailedMessages = [];
-    const spamDetectedMessages = [];
-
-    results.forEach((result, index) => {
-      const message = messages[index];
-
-      if (result.status === 'fulfilled' && result.value.success) {
-        // Successful send
-        sentMessageIds.push(result.value.messageId);
-        sentMessageData.push({
-          whatsapp_number_id: message.whatsapp_number_id,
-          whatsapp_message_id: result.value.whatsappMessageId,
-          user_phone: result.value.phone,
-          direction: 'outgoing',
-          message_type: 'template',
-          campaign_id: result.value.campaignId,
-          template_name: message.template_name,
-          status: 'sent'
-        });
-      } else {
-        // Failed send - mark as permanently failed (no automatic retries)
-        const errorInfo = result.status === 'fulfilled' ? result.value : { messageId: message.id, errorMessage: result.reason?.message };
-
-        // Check if spam error
-        if (errorInfo.errorCode === 131048) {
-          spamDetectedMessages.push(message.id);
-        }
-
-        // All failures are permanent - user can manually retry via button
-        permanentlyFailedMessages.push({
-          id: message.id,
-          errorMessage: errorInfo.errorMessage
-        });
-      }
-    });
-
-    // BATCH DATABASE UPDATES (major performance improvement)
-    const nowISO = new Date().toISOString();
-
-    // Update 1: Mark sent messages
-    if (sentMessageIds.length > 0) {
-      await supabase
-        .from('send_queue')
-        .update({
-          status: 'sent',
-          sent_at: nowISO
-        })
-        .in('id', sentMessageIds);
-
-      // Batch insert messages
-      await supabase.from('messages').insert(sentMessageData);
-
-      // Batch insert status logs
-      const statusLogs = sentMessageData.map(msg => ({
-        whatsapp_message_id: msg.whatsapp_message_id,
-        status: 'sent',
-        campaign_id: msg.campaign_id
-      }));
-      await supabase.from('message_status_logs').insert(statusLogs);
-
-      // Update in-memory counter cache (will flush based on conditions)
-      cache.pendingSent += sentMessageIds.length;
-
-      console.log(`[Queue] ✅ Sent ${sentMessageIds.length} messages successfully`);
+    if (templates) {
+      templates.forEach(t => {
+        templateMap[t.name] = { components: t.components, language: t.language };
+      });
+      console.log(`[Queue] Loaded ${templates.length} templates for campaign ${campaignId}`);
     }
 
-    // Update 2: Mark spam-detected messages
-    if (spamDetectedMessages.length > 0) {
-      await supabase
+    // MAIN PROCESSING LOOP - Continuous processing until campaign complete
+    let consecutiveEmptyBatches = 0;
+    const BATCH_SIZE = 40; // Increased batch size for better throughput
+    const MAX_CONCURRENT = 5; // Moderate concurrency
+    // Dynamic delay based on adaptive rate - will be calculated per batch
+
+    while (campaign.status === 'running') {
+      const batchStartTime = Date.now();
+
+      // Get current template index
+      const currentTemplateIndex = campaign.current_template_index || 0;
+      const totalTemplates = campaign.template_names?.length || 0;
+
+      // CRITICAL FIX: Reset stuck 'processing' entries from previous crashes/restarts
+      // Only reset entries that don't have a WAMID (weren't actually sent)
+      // REDUCED to 2 minutes to prevent template blocking
+      const STUCK_TIMEOUT_MINUTES = 2;
+      const stuckCutoff = new Date(Date.now() - STUCK_TIMEOUT_MINUTES * 60 * 1000).toISOString();
+
+      const { data: stuckEntries, error: stuckError } = await supabase
         .from('send_queue')
-        .update({ spam_error_detected: true })
-        .in('id', spamDetectedMessages);
-
-      // Check spam count and trigger auto-pause if needed
-      const { data: spamCount } = await supabase
-        .rpc('count_recent_spam_errors', {
-          p_campaign_id: campaignId,
-          p_minutes_ago: 10
-        });
-
-      const recentSpamErrors = spamCount || 0;
-      if (recentSpamErrors >= 30) {
-        console.log(`[Queue] 🚨 Spam threshold reached: ${recentSpamErrors} errors`);
-        await handleSpamAutoPause(campaignId, whatsappNumber.id);
-      }
-    }
-
-    // Update 3: Mark permanently failed (no automatic retries)
-    if (permanentlyFailedMessages.length > 0) {
-      const failedIds = permanentlyFailedMessages.map(f => f.id);
-      await supabase
-        .from('send_queue')
-        .update({
-          status: 'failed',
-          error_message: permanentlyFailedMessages[0].errorMessage // Use first error as representative
-        })
-        .in('id', failedIds);
-
-      // Update in-memory counter cache (will flush based on conditions)
-      cache.pendingFailed += permanentlyFailedMessages.length;
-
-      console.log(`[Queue] ❌ ${permanentlyFailedMessages.length} messages permanently failed`);
-    }
-
-    // Increment batch counter and conditionally flush to database
-    cache.batchesSinceLastUpdate++;
-    await flushCounterCache(campaignId);
-
-    // Rate limiting: Wait between batches
-    const delayBetweenBatches = (CONCURRENT_REQUESTS / rateState.currentRate) * 1000;
-    await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
-
-    rateState.isProcessing = false;
-
-    // Check if current template's first-attempts are complete and progress
-    if (currentTemplateIndex < totalTemplates) {
-      await checkAndProgressTemplate(campaignId, currentTemplateIndex, totalTemplates);
-    }
-
-    // Check if there are more messages to process
-    const { data: remainingMessages } = await supabase
-      .from('send_queue')
-      .select('id')
-      .eq('campaign_id', campaignId)
-      .eq('status', 'ready')
-      .limit(1);
-
-    if (remainingMessages && remainingMessages.length > 0) {
-      // Continue processing immediately (rate limiting is already applied per-message)
-      setImmediate(() => processCampaignQueue(campaignId));
-    } else {
-      // Check if campaign is complete
-      console.log(`[Queue] Checking if campaign ${campaignId} is complete...`);
-      const { data: stats, error: statsError, count: pendingCount } = await supabase
-        .from('send_queue')
-        .select('status', { count: 'exact' })
+        .update({ status: 'ready' })
         .eq('campaign_id', campaignId)
-        .in('status', ['ready', 'processing']);
+        .eq('status', 'processing')
+        .is('whatsapp_message_id', null)
+        .lt('updated_at', stuckCutoff)
+        .select('id');
 
-      console.log(`[Queue] Pending messages after batch: ${pendingCount || 0} messages with status ready/processing`);
-
-      if (statsError) {
-        console.error(`[Queue] Error checking pending messages after batch:`, statsError);
-        return;
+      if (stuckEntries && stuckEntries.length > 0) {
+        console.log(`[Queue] ⚠️  Reset ${stuckEntries.length} stuck 'processing' entries to 'ready'`);
       }
 
-      // FIXED: Same comprehensive check as above
-      if (pendingCount === 0) {
-        const { data: campaign } = await supabase
-          .from('campaigns')
-          .select('total_contacts, total_sent, total_failed')
-          .eq('id', campaignId)
-          .single();
+      // Fetch ready messages for current template
+      const { data: messages, error: fetchError } = await supabase
+        .from('send_queue')
+        .select('*')
+        .eq('campaign_id', campaignId)
+        .eq('status', 'ready')
+        .eq('template_order', currentTemplateIndex)
+        .order('created_at', { ascending: true })
+        .limit(BATCH_SIZE);
 
-        const processedCount = (campaign?.total_sent || 0) + (campaign?.total_failed || 0);
-        const totalContacts = campaign?.total_contacts || 0;
+      // STRAGGLER PROCESSING: If current template batch is small, add stragglers from previous templates
+      // This handles messages that were skipped when we moved to next template (due to smart skip logic)
+      let stragglers = [];
+      if (currentTemplateIndex > 0 && messages && messages.length < BATCH_SIZE) {
+        const stragglerLimit = Math.min(50, BATCH_SIZE - messages.length);
+        const { data: stragglersData, error: stragglerError } = await supabase
+          .from('send_queue')
+          .select('*')
+          .eq('campaign_id', campaignId)
+          .eq('status', 'ready')
+          .lt('template_order', currentTemplateIndex) // Only previous templates
+          .order('template_order', { ascending: true })
+          .order('created_at', { ascending: true })
+          .limit(stragglerLimit);
 
-        console.log(`[Queue] Campaign progress: ${processedCount}/${totalContacts} messages processed`);
+        if (!stragglerError && stragglersData && stragglersData.length > 0) {
+          stragglers = stragglersData;
+          console.log(`[Queue] 📦 Adding ${stragglers.length} stragglers from previous templates to current batch`);
+        }
+      }
 
-        if (processedCount >= totalContacts || pendingCount === 0) {
-          console.log(`[Queue] Marking campaign ${campaignId} as completed...`);
+      // Combine current template messages with stragglers
+      const allMessages = messages ? [...messages, ...stragglers] : stragglers;
 
-          // Force flush any remaining cached counters before completion
-          await flushCounterCache(campaignId, true);
+      if (fetchError) {
+        console.error(`[Queue] Error fetching messages:`, fetchError);
+        // Wait before retrying to let connection pool recover
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        continue; // Retry instead of breaking
+      }
 
-          const { error: updateError } = await supabase
-            .from('campaigns')
-            .update({
-              status: 'completed',
-              end_time: new Date().toISOString()
-            })
-            .eq('id', campaignId)
-            .eq('status', 'running'); // Only update if still running
+      if (!allMessages || allMessages.length === 0) {
+        consecutiveEmptyBatches++;
 
-          if (updateError) {
-            console.error(`[Queue] Error marking campaign as completed:`, updateError);
+        // Check if we should move to next template
+        if (currentTemplateIndex < totalTemplates - 1) {
+          // Get counts for current template
+          const { data: templateCounts } = await supabase
+            .from('send_queue')
+            .select('status')
+            .eq('campaign_id', campaignId)
+            .eq('template_order', currentTemplateIndex);
+
+          const processingCount = templateCounts.filter(m => m.status === 'processing').length;
+          const readyCount = templateCounts.filter(m => m.status === 'ready').length;
+          const totalInTemplate = templateCounts.length;
+          const completedCount = totalInTemplate - processingCount - readyCount;
+
+          // SMART SKIP LOGIC: Move to next template if:
+          // 1. No processing entries (all done), OR
+          // 2. <1% stuck in processing AND >99% complete (don't wait for stragglers)
+          const percentComplete = (completedCount / totalInTemplate) * 100;
+          const percentStuck = (processingCount / totalInTemplate) * 100;
+
+          if (processingCount === 0 || (percentStuck < 1 && percentComplete > 99)) {
+            // Move to next template
+            const nextTemplateIndex = currentTemplateIndex + 1;
+
+            if (processingCount > 0) {
+              console.log(`[Queue] ⚠️ Template ${currentTemplateIndex} skipping ${processingCount} stuck entries (${percentStuck.toFixed(2)}% stuck, ${percentComplete.toFixed(1)}% complete)`);
+              console.log(`[Queue] Moving to template ${nextTemplateIndex} - stuck entries will auto-reset in ${STUCK_TIMEOUT_MINUTES} min`);
+            } else {
+              console.log(`[Queue] ✅ Template ${currentTemplateIndex} complete, moving to template ${nextTemplateIndex}`);
+            }
+
+            await supabase
+              .from('campaigns')
+              .update({ current_template_index: nextTemplateIndex })
+              .eq('id', campaignId);
+
+            campaign.current_template_index = nextTemplateIndex;
+            consecutiveEmptyBatches = 0;
+            continue;
+          }
+        }
+
+        // Check if campaign is complete
+        if (consecutiveEmptyBatches >= 3) {
+          const { count: pendingCount } = await supabase
+            .from('send_queue')
+            .select('*', { count: 'exact', head: true })
+            .eq('campaign_id', campaignId)
+            .in('status', ['ready', 'processing']);
+
+          if (pendingCount === 0) {
+            // Campaign complete
+            await flushCounterCache(campaignId, true);
+
+            await supabase
+              .from('campaigns')
+              .update({
+                status: 'completed',
+                end_time: new Date().toISOString()
+              })
+              .eq('id', campaignId);
+
+            // Calculate and log final metrics
+            const totalTime = (Date.now() - metrics.startTime) / 1000;
+            const avgSpeed = metrics.totalSent / totalTime;
+            console.log(`[Queue] ✅ Campaign ${campaignId} completed!`);
+            console.log(`[Queue] Total sent: ${metrics.totalSent}, Failed: ${metrics.totalFailed}`);
+            console.log(`[Queue] Total time: ${totalTime.toFixed(1)}s, Avg speed: ${avgSpeed.toFixed(1)} msg/sec`);
+
+            break;
+          }
+        }
+
+        // Small delay before checking again
+        await new Promise(resolve => setTimeout(resolve, 100));
+        continue;
+      }
+
+      consecutiveEmptyBatches = 0;
+      console.log(`[Queue] Processing batch of ${allMessages.length} messages (${messages?.length || 0} current + ${stragglers.length} stragglers) at ${rateState.currentRate} msg/sec`);
+
+      // Mark batch as processing
+      const messageIds = allMessages.map(m => m.id);
+      await supabase
+        .from('send_queue')
+        .update({ status: 'processing' })
+        .in('id', messageIds);
+
+      // OPTIMIZED PARALLEL PROCESSING with Promise.allSettled
+      const limit = pLimit(MAX_CONCURRENT);
+
+      // Calculate dynamic delay based on current adaptive rate
+      const dynamicDelay = Math.max(10, Math.floor(1000 / (rateState.currentRate || 40)));
+
+      const sendPromises = allMessages.map((message, index) =>
+        limit(async () => {
+          // Add delay between sends to respect rate limit (except for first message)
+          if (index > 0) {
+            await new Promise(resolve => setTimeout(resolve, dynamicDelay));
+          }
+          try {
+            // CRITICAL FIX: Idempotency check - verify this message wasn't already sent
+            // This prevents duplicate sends after PM2 restarts or race conditions
+            const { data: currentEntry } = await supabase
+              .from('send_queue')
+              .select('whatsapp_message_id, status')
+              .eq('id', message.id)
+              .single();
+
+            if (currentEntry.whatsapp_message_id) {
+              // Message already sent (has WAMID) - skip to prevent duplicate
+              console.log(`[Queue] ⚠️  Skipping already-sent message ${message.id} (WAMID: ${currentEntry.whatsapp_message_id})`);
+              return {
+                success: true,
+                skipped: true,
+                messageId: message.id,
+                phone: message.phone
+              };
+            }
+
+            // Get template from cache
+            let template = templateMap[message.template_name];
+
+            if (!template) {
+              // Lazy fetch if not in cache
+              const { data: fetchedTemplate } = await supabase
+                .from('templates')
+                .select('components, language')
+                .eq('whatsapp_number_id', message.whatsapp_number_id)
+                .eq('name', message.template_name)
+                .single();
+
+              if (fetchedTemplate) {
+                template = fetchedTemplate;
+                templateMap[message.template_name] = template;
+              } else {
+                throw new Error(`Template ${message.template_name} not found`);
+              }
+            }
+
+            // Send message
+            const result = await sendTemplateMessage(
+              whatsappNumber.phone_number_id,
+              whatsappNumber.access_token,
+              message.phone,
+              message.template_name,
+              template.language,
+              message.payload,
+              template.components
+            );
+
+            if (result.success) {
+              // CRITICAL FIX: Immediately store WAMID to prevent duplicate sends
+              // This happens BEFORE any other database updates to ensure idempotency
+              await supabase
+                .from('send_queue')
+                .update({
+                  whatsapp_message_id: result.messageId,
+                  actual_sent_at: new Date().toISOString()
+                })
+                .eq('id', message.id);
+
+              await adjustRate(message.whatsapp_number_id, rateState, null, maxLimit);
+              return {
+                success: true,
+                messageId: message.id,
+                whatsappMessageId: result.messageId,
+                phone: message.phone,
+                campaignId: message.campaign_id,
+                templateName: message.template_name
+              };
+            } else {
+              throw new Error(result.error || 'Failed to send message');
+            }
+
+          } catch (error) {
+            const errorCode = error.response?.data?.error?.code ||
+                            error.response?.data?.error?.error_subcode;
+
+            // Handle rate limiting
+            if (errorCode === 130429 || errorCode === 80007) {
+              await adjustRate(message.whatsapp_number_id, rateState, errorCode, maxLimit);
+            }
+
+            return {
+              success: false,
+              messageId: message.id,
+              errorMessage: error.message,
+              errorCode: errorCode
+            };
+          }
+        })
+      );
+
+      // Wait for all messages in batch to complete
+      const results = await Promise.allSettled(sendPromises);
+
+      // Process results
+      const sentMessages = [];
+      const skippedMessages = [];
+      const failedMessages = [];
+      const spamMessages = [];
+
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled' && result.value.success) {
+          // Check if message was skipped (already sent)
+          if (result.value.skipped) {
+            skippedMessages.push({
+              queueId: result.value.messageId,
+              phone: result.value.phone
+            });
           } else {
-            console.log(`[Queue] ✅ Campaign ${campaignId} completed successfully`);
-
-            // Clean up counter cache for completed campaign
-            counterCache.delete(campaignId);
+            sentMessages.push({
+              queueId: result.value.messageId,
+              whatsappMessageId: result.value.whatsappMessageId,
+              phone: result.value.phone,
+              campaignId: result.value.campaignId,
+              templateName: result.value.templateName
+            });
           }
         } else {
-          console.log(`[Queue] ⚠️  Campaign ${campaignId} has pending messages but none matched query. Will retry on next poll.`);
+          const errorInfo = result.status === 'fulfilled' ? result.value :
+                          { messageId: allMessages[index].id, errorMessage: result.reason?.message };
+
+          if (errorInfo.errorCode === 131048) {
+            spamMessages.push(errorInfo.messageId);
+          }
+
+          failedMessages.push(errorInfo);
         }
+      });
+
+      // Batch database updates
+      const now = new Date().toISOString();
+
+      // Update sent messages
+      if (sentMessages.length > 0) {
+        // Update queue status
+        await supabase
+          .from('send_queue')
+          .update({ status: 'sent', sent_at: now })
+          .in('id', sentMessages.map(m => m.queueId));
+
+        // Insert message records
+        const messageRecords = sentMessages.map(m => ({
+          whatsapp_number_id: whatsappNumber.id,
+          whatsapp_message_id: m.whatsappMessageId,
+          user_phone: m.phone,
+          direction: 'outgoing',
+          message_type: 'template',
+          campaign_id: m.campaignId,
+          template_name: m.templateName,
+          status: 'sent'
+        }));
+
+        await supabase.from('messages').insert(messageRecords);
+
+        // Update counters
+        cache.pendingSent += sentMessages.length;
+        metrics.totalSent += sentMessages.length;
+      }
+
+      // Update failed messages
+      if (failedMessages.length > 0) {
+        await supabase
+          .from('send_queue')
+          .update({
+            status: 'failed',
+            error_message: failedMessages[0].errorMessage
+          })
+          .in('id', failedMessages.map(m => m.messageId));
+
+        cache.pendingFailed += failedMessages.length;
+        metrics.totalFailed += failedMessages.length;
+      }
+
+      // Handle spam detection
+      if (spamMessages.length > 0) {
+        await supabase
+          .from('send_queue')
+          .update({ spam_error_detected: true })
+          .in('id', spamMessages);
+
+        // Check if we need to pause for spam
+        const { data: spamCount } = await supabase
+          .rpc('count_recent_spam_errors', {
+            p_campaign_id: campaignId,
+            p_minutes_ago: 10
+          });
+
+        if ((spamCount || 0) >= 30) {
+          await handleSpamAutoPause(campaignId, whatsappNumber.id);
+          break; // Exit processing loop
+        }
+      }
+
+      // Update performance metrics
+      const batchTime = Date.now() - batchStartTime;
+      metrics.batchCount++;
+      metrics.avgBatchTime = (metrics.avgBatchTime * (metrics.batchCount - 1) + batchTime) / metrics.batchCount;
+
+      // Update lastUpdateTime to prevent stale detection
+      rateState.lastUpdateTime = Date.now();
+
+      // Flush cache periodically
+      cache.batchesSinceLastUpdate++;
+      await flushCounterCache(campaignId);
+
+      // Log performance
+      const batchThroughput = sentMessages.length / (batchTime / 1000);
+      const overallThroughput = metrics.totalSent / ((Date.now() - metrics.startTime) / 1000);
+      console.log(`[Queue] Batch complete: ${sentMessages.length} sent, ${failedMessages.length} failed${skippedMessages.length > 0 ? `, ${skippedMessages.length} skipped (already sent)` : ''}`);
+      console.log(`[Queue] Batch throughput: ${batchThroughput.toFixed(1)} msg/sec, Overall: ${overallThroughput.toFixed(1)} msg/sec`);
+
+      // Dynamic delay based on rate limit
+      if (rateState.currentRate < 100) {
+        // Only add delay if we're being rate limited
+        const delay = Math.max(10, 1000 / rateState.currentRate);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+      // No delay for high rates - continuous processing
+
+      // Re-check campaign status
+      const { data: updatedCampaign } = await supabase
+        .from('campaigns')
+        .select('status')
+        .eq('id', campaignId)
+        .single();
+
+      if (updatedCampaign) {
+        campaign.status = updatedCampaign.status;
       }
     }
 
   } catch (error) {
     console.error(`[Queue] Error processing campaign ${campaignId}:`, error);
-
-    // Reset processing flag
-    const rateState = rateControlState.get(campaign?.whatsapp_number_id);
+  } finally {
+    // Clean up - reset isProcessing for the WhatsApp number
     if (rateState) {
       rateState.isProcessing = false;
+    } else if (campaign?.whatsapp_number_id) {
+      // If rateState wasn't assigned yet, get it from the map and reset
+      const state = rateControlState.get(campaign.whatsapp_number_id);
+      if (state) {
+        state.isProcessing = false;
+      }
     }
+
+    // Force flush any remaining counters
+    await flushCounterCache(campaignId, true);
+
+    // Clean up caches
+    counterCache.delete(campaignId);
+    performanceMetrics.delete(campaignId);
   }
 }
 
@@ -992,18 +858,13 @@ async function processQueue() {
       .eq('status', 'running')
       .order('created_at', { ascending: true });
 
-    if (error) {
-      console.error('[Queue] Error fetching campaigns:', error);
-      return;
-    }
-
-    if (!campaigns || campaigns.length === 0) {
+    if (error || !campaigns || campaigns.length === 0) {
       return;
     }
 
     console.log(`[Queue] Found ${campaigns.length} running campaigns`);
 
-    // Group campaigns by WhatsApp number (sequential execution per number)
+    // Group campaigns by WhatsApp number
     const campaignsByNumber = new Map();
     campaigns.forEach(campaign => {
       if (!campaignsByNumber.has(campaign.whatsapp_number_id)) {
@@ -1013,13 +874,66 @@ async function processQueue() {
     });
 
     // Process campaigns (sequential per number, parallel across numbers)
+    const processingPromises = [];
+
     for (const [numberId, campaignIds] of campaignsByNumber) {
-      // Process first campaign for this number (others will wait)
-      const firstCampaignId = campaignIds[0];
-      processCampaignQueue(firstCampaignId).catch(err => {
-        console.error(`[Queue] Error in campaign ${firstCampaignId}:`, err);
-      });
+      // Get rate state to check if processing
+      const rateState = rateControlState.get(numberId);
+
+      // CRITICAL FIX: Check if isProcessing is stale (no activity for >10 seconds)
+      // This handles cases where processing was interrupted by restart/crash
+      const isStale = rateState?.isProcessing &&
+                     rateState?.lastUpdateTime &&
+                     (Date.now() - rateState.lastUpdateTime) > 10000;
+
+      if (isStale) {
+        console.log(`[Queue] Detected stale isProcessing for number ${numberId} - resetting`);
+        rateState.isProcessing = false;
+      }
+
+      console.log(`[Queue] Number ${numberId}: rateState exists=${!!rateState}, isProcessing=${rateState?.isProcessing}, stale=${isStale}`);
+
+      if (!rateState || !rateState.isProcessing) {
+        // Process first campaign for this number
+        const firstCampaignId = campaignIds[0];
+        console.log(`[Queue] Starting processing for campaign ${firstCampaignId}`);
+
+        // CRITICAL: Set isProcessing BEFORE calling processCampaignQueue to prevent race condition
+        if (!rateState) {
+          // Initialize rate state if it doesn't exist
+          rateControlState.set(numberId, {
+            currentRate: 80,
+            errorCount: 0,
+            consecutiveErrorCount: 0,
+            lastErrorTime: null,
+            successWindow: [],
+            errorWindow: [],
+            isProcessing: true,  // Set immediately
+            lastUpdateTime: Date.now(),
+            totalMessagesSent: 0,
+            lastRateIncrease: Date.now()
+          });
+        } else {
+          rateState.isProcessing = true;  // Set immediately
+          rateState.lastUpdateTime = Date.now();
+        }
+
+        processingPromises.push(
+          processCampaignQueue(firstCampaignId).catch(err => {
+            console.error(`[Queue] Error in campaign ${firstCampaignId}:`, err);
+            // Reset isProcessing on error
+            const state = rateControlState.get(numberId);
+            if (state) state.isProcessing = false;
+          })
+        );
+      } else {
+        console.log(`[Queue] Skipping number ${numberId} - already processing`);
+      }
     }
+
+    // Note: Don't await here - let campaigns process independently
+    // The isProcessing flag in rateState prevents duplicate processing per number
+    // Awaiting would block the entire processor and exhaust connection pool
 
   } catch (error) {
     console.error('[Queue] Error in main queue processor:', error);
@@ -1027,55 +941,71 @@ async function processQueue() {
 }
 
 /**
- * Start queue processor with adaptive interval
- * Fast when campaigns are active, slower when idle
+ * Start queue processor with continuous polling for maximum throughput
  */
-function startQueueProcessor(fastInterval = 100, slowInterval = 5000) {
-  console.log('[Queue] Starting queue processor with adaptive interval...');
+function startQueueProcessor() {
+  console.log('[Queue] Starting high-performance queue processor...');
 
-  let currentInterval = slowInterval;
-  let intervalHandle = null;
-  let consecutiveEmptyPolls = 0;
+  // CRITICAL FIX: Clear ALL rate control states from previous runs
+  // This prevents campaigns from being permanently blocked after crashes/restarts
+  // We clear the entire Map to ensure clean state on startup
+  console.log('[Queue] Clearing all rate control states from previous runs...');
+  const previousCount = rateControlState.size;
+  rateControlState.clear();
+  console.log(`[Queue] Cleared ${previousCount} rate control states - fresh start ready`);
 
-  async function adaptiveProcessQueue() {
-    // Get count of running campaigns
-    const { count: runningCount } = await supabase
+  let isProcessing = false;
+
+  async function continuousProcess() {
+    if (isProcessing) return;
+
+    isProcessing = true;
+
+    try {
+      // Check for active campaigns
+      const { count: runningCount } = await supabase
+        .from('campaigns')
+        .select('*', { count: 'exact', head: true })
+        .eq('status', 'running');
+
+      if (runningCount > 0) {
+        await processQueue();
+        // Add delay between iterations to prevent connection pool exhaustion
+        setTimeout(continuousProcess, 500);
+      } else {
+        // No active campaigns, check again after short delay
+        setTimeout(continuousProcess, 2000);
+      }
+    } catch (error) {
+      console.error('[Queue] Error in continuous processor:', error);
+      setTimeout(continuousProcess, 1000);
+    } finally {
+      isProcessing = false;
+    }
+  }
+
+  // Start continuous processing
+  continuousProcess();
+
+  // Also set up periodic check as backup
+  setInterval(async () => {
+    const { count } = await supabase
       .from('campaigns')
       .select('*', { count: 'exact', head: true })
       .eq('status', 'running');
 
-    // Adjust interval based on activity
-    if (runningCount > 0) {
-      // Active campaigns - use fast interval
-      if (currentInterval !== fastInterval) {
-        console.log(`[Queue] Switching to fast interval (${fastInterval}ms) - ${runningCount} active campaign(s)`);
-        currentInterval = fastInterval;
-        clearInterval(intervalHandle);
-        intervalHandle = setInterval(adaptiveProcessQueue, fastInterval);
-      }
-      consecutiveEmptyPolls = 0;
-    } else {
-      // No active campaigns - use slow interval
-      consecutiveEmptyPolls++;
-      if (consecutiveEmptyPolls >= 3 && currentInterval !== slowInterval) {
-        console.log(`[Queue] Switching to slow interval (${slowInterval}ms) - no active campaigns`);
-        currentInterval = slowInterval;
-        clearInterval(intervalHandle);
-        intervalHandle = setInterval(adaptiveProcessQueue, slowInterval);
-      }
+    if (count > 0 && !isProcessing) {
+      continuousProcess();
     }
+  }, 5000);
 
-    // Process the queue
-    await processQueue();
-  }
+  console.log('[Queue] High-performance processor started!');
+}
 
-  // Start with first poll
-  adaptiveProcessQueue();
-
-  // Set initial interval (slow by default)
-  intervalHandle = setInterval(adaptiveProcessQueue, slowInterval);
-
-  return intervalHandle;
+// Helper function for retry delays (simplified - no automatic retries in this version)
+function getRetryDelay(retryCount) {
+  const delays = [5000, 20000, 45000]; // 5s, 20s, 45s
+  return delays[Math.min(retryCount, delays.length - 1)];
 }
 
 module.exports = {

@@ -16,6 +16,9 @@ const Campaigns = () => {
   const [successMessage, setSuccessMessage] = useState('');
   const [selectedCampaign, setSelectedCampaign] = useState(null);
   const [showDetailsModal, setShowDetailsModal] = useState(false);
+  const [templateStats, setTemplateStats] = useState(null);
+  const [loadingTemplateStats, setLoadingTemplateStats] = useState(false);
+  const [showTemplateBreakdown, setShowTemplateBreakdown] = useState(false);
 
   // Form state
   const [formData, setFormData] = useState({
@@ -40,13 +43,17 @@ const Campaigns = () => {
     today.setHours(0, 0, 0, 0);
 
     if (dateFilter === 'today') {
+      const endOfDay = new Date(today);
+      endOfDay.setHours(23, 59, 59, 999);
       return {
         start_date: today.toISOString(),
-        end_date: today.toISOString()
+        end_date: endOfDay.toISOString()
       };
     } else if (dateFilter === 'current_month') {
       const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+      firstDay.setHours(0, 0, 0, 0);
       const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+      lastDay.setHours(23, 59, 59, 999);
       return {
         start_date: firstDay.toISOString(),
         end_date: lastDay.toISOString()
@@ -313,12 +320,64 @@ const Campaigns = () => {
 
   const viewCampaignDetails = async (campaignId) => {
     try {
+      // Fetch campaign without template stats (fast)
       const result = await campaignsAPI.get(campaignId);
       setSelectedCampaign(result.data);
+      setTemplateStats(null);
+      setShowTemplateBreakdown(false);
       setShowDetailsModal(true);
+
+      // Setup realtime subscription for live updates
+      const channel = supabase
+        .channel(`campaign-${campaignId}`)
+        .on('postgres_changes', {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'campaigns',
+          filter: `id=eq.${campaignId}`
+        }, (payload) => {
+          console.log('[Realtime] Campaign update received:', payload);
+          setSelectedCampaign(prev => ({
+            ...prev,
+            ...payload.new
+          }));
+        })
+        .subscribe();
+
+      // Store channel for cleanup
+      window.__campaignRealtimeChannel = channel;
     } catch (err) {
       console.error('Failed to load campaign details:', err);
       setError(err.response?.data?.message || 'Failed to load campaign details');
+    }
+  };
+
+  const loadTemplateBreakdown = async () => {
+    if (!selectedCampaign) return;
+
+    try {
+      setLoadingTemplateStats(true);
+      const result = await campaignsAPI.getTemplateStats(selectedCampaign.id);
+      setTemplateStats(result.data);
+      setShowTemplateBreakdown(true);
+    } catch (err) {
+      console.error('Failed to load template stats:', err);
+      setError(err.response?.data?.message || 'Failed to load template statistics');
+    } finally {
+      setLoadingTemplateStats(false);
+    }
+  };
+
+  const closeDetailsModal = () => {
+    setShowDetailsModal(false);
+    setSelectedCampaign(null);
+    setTemplateStats(null);
+    setShowTemplateBreakdown(false);
+
+    // Cleanup realtime subscription
+    if (window.__campaignRealtimeChannel) {
+      supabase.removeChannel(window.__campaignRealtimeChannel);
+      window.__campaignRealtimeChannel = null;
     }
   };
 
@@ -349,8 +408,11 @@ const Campaigns = () => {
       const result = await campaignsAPI.retryFailed(campaignId);
       setSuccessMessage(result.message || `${result.retriedCount} failed messages queued for retry`);
       loadCampaigns();
+
+      // Refresh campaign details modal if open
       if (selectedCampaign && selectedCampaign.id === campaignId) {
-        loadCampaignDetails(campaignId);
+        const refreshResult = await campaignsAPI.get(campaignId);
+        setSelectedCampaign(refreshResult.data);
       }
     } catch (err) {
       console.error('Retry failed messages error:', err);
@@ -738,6 +800,12 @@ const Campaigns = () => {
                             {new Date(campaign.end_time).toLocaleString()}
                           </div>
                         )}
+                        {campaign.pause_reason && campaign.status === 'paused' && (
+                          <div className="col-span-2">
+                            <span className="font-medium text-orange-600">Pause Reason:</span>{' '}
+                            <span className="text-orange-700">{campaign.pause_reason}</span>
+                          </div>
+                        )}
                         {campaign.start_time && campaign.end_time && campaign.total_sent > 0 && (
                           <div>
                             <span className="font-medium">Avg Speed:</span>{' '}
@@ -775,14 +843,18 @@ const Campaigns = () => {
                           Resume
                         </button>
                       )}
-                      {(campaign.status === 'running' || campaign.status === 'completed' || campaign.status === 'paused') && campaign.total_failed > 0 && (
-                        <button
-                          onClick={() => handleRetryFailed(campaign.id)}
-                          className="inline-flex items-center px-3 py-2 border border-orange-300 text-sm font-medium rounded-md text-orange-700 bg-white hover:bg-orange-50"
-                        >
-                          Retry Failed ({campaign.total_failed})
-                        </button>
-                      )}
+                      {(() => {
+                        const shouldShowRetry = (campaign.status === 'running' || campaign.status === 'completed' || campaign.status === 'paused') && campaign.total_failed > 0;
+                        console.log(`[Campaign ${campaign.name}] Status: ${campaign.status}, Failed: ${campaign.total_failed}, Show Retry: ${shouldShowRetry}`);
+                        return shouldShowRetry ? (
+                          <button
+                            onClick={() => handleRetryFailed(campaign.id)}
+                            className="inline-flex items-center px-3 py-2 border border-orange-300 text-sm font-medium rounded-md text-orange-700 bg-white hover:bg-orange-50"
+                          >
+                            Retry Failed ({campaign.total_failed})
+                          </button>
+                        ) : null;
+                      })()}
                       {(campaign.status === 'scheduled' || campaign.status === 'failed' || campaign.status === 'completed') && (
                         <button
                           onClick={() => handleDeleteCampaign(campaign.id, campaign.name)}
@@ -809,32 +881,191 @@ const Campaigns = () => {
                 Campaign Details: {selectedCampaign.name}
               </h3>
               <button
-                onClick={() => setShowDetailsModal(false)}
+                onClick={closeDetailsModal}
                 className="text-gray-400 hover:text-gray-500"
               >
                 <span className="text-2xl">&times;</span>
               </button>
             </div>
 
-            <div className="grid grid-cols-2 gap-4 mb-6 text-sm">
-              <div>
-                <span className="font-medium">Status:</span> {selectedCampaign.status}
+            {/* Live Update Indicator */}
+            <div className="mb-4">
+              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+                <span className="animate-pulse mr-1">●</span>
+                Live Updates Active
+              </span>
+            </div>
+
+            {/* Progress Bar */}
+            <div className="mb-6">
+              <div className="flex justify-between items-center mb-2">
+                <h4 className="text-md font-medium text-gray-900">Campaign Progress</h4>
+                <span className="text-sm text-gray-600">
+                  {selectedCampaign.total_sent + selectedCampaign.total_failed} / {selectedCampaign.total_contacts} processed
+                  {selectedCampaign.total_contacts > 0 && (
+                    <span className="ml-1">
+                      ({Math.round(((selectedCampaign.total_sent + selectedCampaign.total_failed) / selectedCampaign.total_contacts) * 100)}%)
+                    </span>
+                  )}
+                </span>
               </div>
-              <div>
-                <span className="font-medium">Total Contacts:</span> {selectedCampaign.total_contacts}
+              <div className="w-full bg-gray-200 rounded-full h-6 overflow-hidden">
+                <div className="h-full flex">
+                  {/* Sent (Green) */}
+                  <div
+                    className="bg-green-500 flex items-center justify-center text-xs text-white font-semibold transition-all duration-500"
+                    style={{
+                      width: `${selectedCampaign.total_contacts > 0 ? (selectedCampaign.total_sent / selectedCampaign.total_contacts) * 100 : 0}%`
+                    }}
+                  >
+                    {selectedCampaign.total_sent > 0 && selectedCampaign.total_contacts > 0 &&
+                      ((selectedCampaign.total_sent / selectedCampaign.total_contacts) * 100) > 5 &&
+                      `${Math.round((selectedCampaign.total_sent / selectedCampaign.total_contacts) * 100)}%`
+                    }
+                  </div>
+                  {/* Failed (Red) */}
+                  <div
+                    className="bg-red-500 flex items-center justify-center text-xs text-white font-semibold transition-all duration-500"
+                    style={{
+                      width: `${selectedCampaign.total_contacts > 0 ? (selectedCampaign.total_failed / selectedCampaign.total_contacts) * 100 : 0}%`
+                    }}
+                  >
+                    {selectedCampaign.total_failed > 0 && selectedCampaign.total_contacts > 0 &&
+                      ((selectedCampaign.total_failed / selectedCampaign.total_contacts) * 100) > 5 &&
+                      `${Math.round((selectedCampaign.total_failed / selectedCampaign.total_contacts) * 100)}%`
+                    }
+                  </div>
+                </div>
               </div>
-              <div>
-                <span className="font-medium">Sent:</span> {selectedCampaign.total_sent}
-              </div>
-              <div>
-                <span className="font-medium">Failed:</span> {selectedCampaign.total_failed}
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>✓ Sent: {selectedCampaign.total_sent}</span>
+                <span>✗ Failed: {selectedCampaign.total_failed}</span>
+                <span>⏳ Pending: {selectedCampaign.total_contacts - selectedCampaign.total_sent - selectedCampaign.total_failed}</span>
               </div>
             </div>
 
-            {/* Template Breakdown */}
-            {selectedCampaign.templateStats && Object.keys(selectedCampaign.templateStats).length > 0 && (
+            {/* Overall Statistics */}
+            <div className="mb-6">
+              <h4 className="text-md font-medium text-gray-900 mb-3">Overall Statistics</h4>
+              <div className="grid grid-cols-3 gap-4 text-sm">
+                <div className="bg-gray-50 p-3 rounded">
+                  <span className="font-medium text-gray-600">Status:</span>{' '}
+                  <span className={`font-semibold ${
+                    selectedCampaign.status === 'running' ? 'text-green-600' :
+                    selectedCampaign.status === 'paused' ? 'text-yellow-600' :
+                    selectedCampaign.status === 'completed' ? 'text-blue-600' :
+                    'text-gray-600'
+                  }`}>
+                    {selectedCampaign.status}
+                  </span>
+                </div>
+                <div className="bg-gray-50 p-3 rounded">
+                  <span className="font-medium text-gray-600">Total Contacts:</span>{' '}
+                  <span className="font-semibold">{selectedCampaign.total_contacts}</span>
+                </div>
+                <div className="bg-green-50 p-3 rounded">
+                  <span className="font-medium text-green-700">Sent:</span>{' '}
+                  <span className="font-semibold text-green-800">
+                    {selectedCampaign.total_sent}
+                    {selectedCampaign.total_contacts > 0 && (
+                      <span className="text-sm ml-1">
+                        ({Math.round((selectedCampaign.total_sent / selectedCampaign.total_contacts) * 100)}%)
+                      </span>
+                    )}
+                  </span>
+                </div>
+                <div className="bg-blue-50 p-3 rounded">
+                  <span className="font-medium text-blue-700">Delivered:</span>{' '}
+                  <span className="font-semibold text-blue-800">
+                    {selectedCampaign.total_delivered || 0}
+                    {selectedCampaign.total_contacts > 0 && (
+                      <span className="text-sm ml-1">
+                        ({Math.round(((selectedCampaign.total_delivered || 0) / selectedCampaign.total_contacts) * 100)}%)
+                      </span>
+                    )}
+                  </span>
+                </div>
+                <div className="bg-indigo-50 p-3 rounded">
+                  <span className="font-medium text-indigo-700">Read:</span>{' '}
+                  <span className="font-semibold text-indigo-800">
+                    {selectedCampaign.total_read || 0}
+                    {selectedCampaign.total_sent > 0 && (
+                      <span className="text-sm ml-1">
+                        ({Math.round(((selectedCampaign.total_read || 0) / selectedCampaign.total_sent) * 100)}%)
+                      </span>
+                    )}
+                  </span>
+                </div>
+                <div className="bg-purple-50 p-3 rounded">
+                  <span className="font-medium text-purple-700">Replied:</span>{' '}
+                  <span className="font-semibold text-purple-800">
+                    {selectedCampaign.total_replied || 0}
+                    {selectedCampaign.total_sent > 0 && (
+                      <span className="text-sm ml-1">
+                        ({Math.round(((selectedCampaign.total_replied || 0) / selectedCampaign.total_sent) * 100)}%)
+                      </span>
+                    )}
+                  </span>
+                </div>
+                <div className="bg-red-50 p-3 rounded">
+                  <span className="font-medium text-red-700">Failed:</span>{' '}
+                  <span className="font-semibold text-red-800">
+                    {selectedCampaign.total_failed}
+                    {selectedCampaign.total_contacts > 0 && (
+                      <span className="text-sm ml-1">
+                        ({Math.round((selectedCampaign.total_failed / selectedCampaign.total_contacts) * 100)}%)
+                      </span>
+                    )}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Action Buttons */}
+            <div className="mt-6 flex gap-3">
+              {!showTemplateBreakdown && (
+                <button
+                  onClick={loadTemplateBreakdown}
+                  disabled={loadingTemplateStats}
+                  className="inline-flex items-center px-4 py-2 border border-blue-300 text-sm font-medium rounded-md text-blue-700 bg-white hover:bg-blue-50 disabled:opacity-50"
+                >
+                  {loadingTemplateStats ? (
+                    <>
+                      <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-blue-700" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                      Loading Template Breakdown...
+                    </>
+                  ) : (
+                    <>📊 View Template Breakdown</>
+                  )}
+                </button>
+              )}
+
+              {/* Retry Failed Button */}
+              {selectedCampaign.total_failed > 0 && (
+                <button
+                  onClick={() => handleRetryFailed(selectedCampaign.id)}
+                  className="inline-flex items-center px-4 py-2 border border-orange-300 text-sm font-medium rounded-md text-orange-700 bg-white hover:bg-orange-50"
+                >
+                  🔄 Retry Failed ({selectedCampaign.total_failed})
+                </button>
+              )}
+            </div>
+
+            {/* Template Breakdown Table */}
+            {showTemplateBreakdown && templateStats && Object.keys(templateStats).length > 0 && (
               <div className="mt-6">
-                <h4 className="text-md font-medium text-gray-900 mb-3">Template-wise Breakdown</h4>
+                <div className="flex justify-between items-center mb-3">
+                  <h4 className="text-md font-medium text-gray-900">Template-wise Breakdown</h4>
+                  <button
+                    onClick={() => setShowTemplateBreakdown(false)}
+                    className="text-sm text-gray-500 hover:text-gray-700"
+                  >
+                    Hide
+                  </button>
+                </div>
                 <div className="overflow-x-auto">
                   <table className="min-w-full divide-y divide-gray-200">
                     <thead className="bg-gray-50">
@@ -863,7 +1094,7 @@ const Campaigns = () => {
                       </tr>
                     </thead>
                     <tbody className="bg-white divide-y divide-gray-200">
-                      {Object.entries(selectedCampaign.templateStats).map(([templateName, stats]) => (
+                      {Object.entries(templateStats).map(([templateName, stats]) => (
                         <tr key={templateName}>
                           <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
                             {templateName}
@@ -896,7 +1127,7 @@ const Campaigns = () => {
 
             <div className="mt-6 flex justify-end">
               <button
-                onClick={() => setShowDetailsModal(false)}
+                onClick={closeDetailsModal}
                 className="px-4 py-2 bg-gray-200 text-gray-700 rounded-md hover:bg-gray-300"
               >
                 Close

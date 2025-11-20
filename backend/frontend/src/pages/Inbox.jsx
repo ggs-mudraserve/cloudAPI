@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import api from '../services/api';
 import { supabase } from '../config/supabase';
@@ -131,8 +131,12 @@ const Inbox = () => {
     fetchConversationMessages(selectedConversation, newOffset, true);
   };
 
+  // Debounce ref to prevent rapid updates during campaigns
+  const debounceTimeoutRef = useRef(null);
+  const lastUpdateRef = useRef(0);
+
   const setupRealtimeSubscriptions = () => {
-    // Subscribe to messages for real-time updates
+    // Subscribe to messages for real-time updates with debouncing
     const messagesChannel = supabase
       .channel('messages-changes')
       .on(
@@ -143,6 +147,24 @@ const Inbox = () => {
           table: 'messages'
         },
         () => {
+          // Debounce: only update every 20 seconds max to prevent excessive refreshing during campaigns
+          const now = Date.now();
+          if (now - lastUpdateRef.current < 20000) {
+            // Schedule update for later if not already scheduled
+            if (!debounceTimeoutRef.current) {
+              debounceTimeoutRef.current = setTimeout(() => {
+                debounceTimeoutRef.current = null;
+                lastUpdateRef.current = Date.now();
+                fetchConversations();
+                if (selectedConversation) {
+                  fetchConversationMessages(selectedConversation);
+                }
+              }, 20000);
+            }
+            return;
+          }
+
+          lastUpdateRef.current = now;
           fetchConversations();
           if (selectedConversation) {
             fetchConversationMessages(selectedConversation);
@@ -153,6 +175,9 @@ const Inbox = () => {
 
     return () => {
       messagesChannel.unsubscribe();
+      if (debounceTimeoutRef.current) {
+        clearTimeout(debounceTimeoutRef.current);
+      }
     };
   };
 

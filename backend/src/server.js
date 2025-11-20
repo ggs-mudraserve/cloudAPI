@@ -51,10 +51,21 @@ app.use('/api/media', require('./routes/media'));
 // Serve frontend build in production
 if (process.env.NODE_ENV === 'production') {
   const path = require('path');
-  app.use(express.static(path.join(__dirname, '../../frontend/dist')));
+  const distPath = path.join(__dirname, '../frontend/dist');
 
+  // Serve static files (JS, CSS, images, HTML files)
+  app.use(express.static(distPath));
+
+  // Catch-all route for React Router - only for non-file requests
+  // This allows direct .html files to be served while routing everything else to React
   app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../../frontend/dist/index.html'));
+    // If the request is for a .html file, serve it directly
+    if (req.path.endsWith('.html')) {
+      res.sendFile(path.join(distPath, req.path));
+    } else {
+      // Otherwise, serve the React app
+      res.sendFile(path.join(distPath, 'index.html'));
+    }
   });
 }
 

@@ -371,6 +371,32 @@ async function calculateMessageStatsWithPercentages(campaignIds, totalContacts) 
  * @returns {Promise<object>} Template stats object
  */
 async function calculateTemplateStats(campaignId) {
+  // PERFORMANCE OPTIMIZATION: Try using fast RPC function first
+  const { data: rpcData, error: rpcError } = await supabase
+    .rpc('get_template_stats_fast', { p_campaign_id: campaignId });
+
+  if (!rpcError && rpcData && rpcData.length > 0) {
+    // RPC succeeded - convert to expected format
+    console.log(`[TemplateStats] Using optimized RPC for campaign ${campaignId}`);
+    const templateStats = {};
+
+    rpcData.forEach(row => {
+      templateStats[row.template_name] = {
+        total: parseInt(row.total),
+        sent: parseInt(row.sent),
+        delivered: parseInt(row.delivered),
+        read: parseInt(row.read),
+        replied: parseInt(row.replied),
+        failed: parseInt(row.failed)
+      };
+    });
+
+    return templateStats;
+  }
+
+  // Fallback to old method if RPC fails or returns no data
+  console.warn(`[TemplateStats] RPC failed or no data, using fallback method for campaign ${campaignId}`);
+
   // Fetch send_queue data to get template mapping
   let queueData = [];
   let from = 0;

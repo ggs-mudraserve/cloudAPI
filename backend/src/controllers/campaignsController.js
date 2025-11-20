@@ -164,8 +164,9 @@ exports.listCampaigns = async (req, res) => {
 exports.getCampaign = async (req, res) => {
   try {
     const { id } = req.params;
+    const includeTemplateStats = req.query.includeTemplateStats === 'true';
 
-    const campaign = await campaignService.getCampaign(id);
+    const campaign = await campaignService.getCampaign(id, includeTemplateStats);
 
     res.json({
       success: true,
@@ -177,6 +178,29 @@ exports.getCampaign = async (req, res) => {
     res.status(500).json({
       success: false,
       message: error.message || 'Failed to get campaign'
+    });
+  }
+};
+
+/**
+ * Get template-level statistics for a campaign
+ */
+exports.getTemplateStats = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const templateStats = await campaignService.getTemplateStats(id);
+
+    res.json({
+      success: true,
+      data: templateStats
+    });
+
+  } catch (error) {
+    console.error('Get template stats error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to get template statistics'
     });
   }
 };
@@ -434,11 +458,14 @@ exports.retryFailedMessages = async (req, res) => {
       })
       .eq('id', id);
 
-    // If campaign was completed, set back to running
+    // If campaign was completed, set back to running AND reset template progress
     if (campaign.status === 'completed') {
       await supabase
         .from('campaigns')
-        .update({ status: 'running' })
+        .update({
+          status: 'running',
+          current_template_index: 0  // Reset to start from first template
+        })
         .eq('id', id);
     }
 

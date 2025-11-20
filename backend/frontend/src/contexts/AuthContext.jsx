@@ -78,6 +78,17 @@ export const AuthProvider = ({ children }) => {
       // Clear local state regardless of API response
       localStorage.removeItem('access_token');
       localStorage.removeItem('refresh_token');
+
+      // Clear ALL old Supabase storage keys (including cloud Supabase remnants)
+      const keysToRemove = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith('sb-')) {
+          keysToRemove.push(key);
+        }
+      }
+      keysToRemove.forEach(key => localStorage.removeItem(key));
+
       setUser(null);
       setIsAuthenticated(false);
     }

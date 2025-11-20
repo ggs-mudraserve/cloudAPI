@@ -4,6 +4,7 @@ require('dotenv').config();
 const { supabase, testConnection } = require('./src/config/supabase');
 const { enqueueMessages } = require('./src/services/campaignService');
 const { notifyCampaignFailed } = require('./src/utils/notifications');
+const { fixAllRunningCampaigns } = require('./auto-fix-template-index');
 
 /**
  * Pre-flight validation for scheduled campaigns
@@ -386,6 +387,14 @@ async function startCronJobs() {
     recoverStuckMessages();
   });
 
+  // Template index fix - every 3 minutes
+  cron.schedule('*/3 * * * *', () => {
+    console.log('[Cron] Running template index auto-fix...');
+    fixAllRunningCampaigns().catch(err =>
+      console.error('[Cron] Error in template index fix:', err)
+    );
+  });
+
   // Cleanup jobs - daily at 3 AM IST (timezone set via TZ env variable)
   cron.schedule('0 3 * * *', () => {
     console.log('[Cron] Running daily cleanup jobs...');
@@ -396,6 +405,7 @@ async function startCronJobs() {
   console.log('✅ Cron jobs started:');
   console.log('   - Campaign scheduler: every minute');
   console.log('   - Spam auto-resume checker: every minute');
+  console.log('   - Template index auto-fix: every 3 minutes');
   console.log('   - Stuck message recovery: every 5 minutes');
   console.log('   - Cleanup jobs: daily at 3 AM IST');
   console.log(`⏰ Timezone: ${process.env.TZ || 'UTC'}`);

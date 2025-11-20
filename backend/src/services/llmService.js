@@ -216,7 +216,7 @@ async function sendWhatsAppTextMessage(whatsappNumber, toPhone, messageText) {
 
     const axios = require('axios');
     const response = await axios.post(
-      `https://graph.facebook.com/v18.0/${phone_number_id}/messages`,
+      `https://graph.facebook.com/v24.0/${phone_number_id}/messages`,
       {
         messaging_product: 'whatsapp',
         to: toPhone,

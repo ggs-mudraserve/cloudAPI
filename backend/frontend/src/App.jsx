@@ -11,6 +11,7 @@ import Campaigns from './pages/Campaigns';
 import Inbox from './pages/Inbox';
 import Settings from './pages/Settings';
 import Notifications from './pages/Notifications';
+import MediaLibrary from './pages/MediaLibrary';
 
 function App() {
   return (
@@ -93,6 +94,17 @@ function App() {
               <ProtectedRoute>
                 <Layout>
                   <Notifications />
+                </Layout>
+              </ProtectedRoute>
+            }
+          />
+
+          <Route
+            path="/media-library"
+            element={
+              <ProtectedRoute>
+                <Layout>
+                  <MediaLibrary />
                 </Layout>
               </ProtectedRoute>
             }

@@ -27,6 +27,7 @@ router.get('/stats', campaignsController.getCampaignStats);
 router.get('/', campaignsController.listCampaigns);
 router.post('/', upload.single('csv'), campaignsController.createCampaign);
 router.get('/:id', campaignsController.getCampaign);
+router.get('/:id/template-stats', campaignsController.getTemplateStats);
 router.delete('/:id', campaignsController.deleteCampaign);
 router.patch('/:id/stop', campaignsController.stopCampaign);
 router.patch('/:id/resume', campaignsController.resumeCampaign);

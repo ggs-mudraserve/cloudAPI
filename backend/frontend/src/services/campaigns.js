@@ -55,5 +55,11 @@ export const campaignsAPI = {
   getStats: async () => {
     const response = await api.get('/campaigns/stats');
     return response.data;
+  },
+
+  // Get template-level statistics for a campaign
+  getTemplateStats: async (id) => {
+    const response = await api.get(`/campaigns/${id}/template-stats`);
+    return response.data;
   }
 };

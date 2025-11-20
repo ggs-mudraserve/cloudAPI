@@ -136,7 +136,7 @@ async function getMediaUrl(mediaId, accessToken) {
   try {
     // Step 1: Get media URL from WhatsApp API
     const response = await axios.get(
-      `https://graph.facebook.com/v18.0/${mediaId}`,
+      `https://graph.facebook.com/v24.0/${mediaId}`,
       {
         headers: {
           'Authorization': `Bearer ${accessToken}`

@@ -1,11 +1,70 @@
 const express = require('express');
 const router = express.Router();
 const axios = require('axios');
+const multer = require('multer');
 const { supabase } = require('../config/supabase');
 const { validateJWT } = require('../middleware/auth');
+const {
+  uploadMediaFile,
+  getMediaLibrary,
+  getAllMedia,
+  deleteMedia,
+  updateMedia
+} = require('../controllers/mediaController');
+
+// Configure multer for memory storage
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 16 * 1024 * 1024 // 16 MB limit (WhatsApp's max for video)
+  },
+  fileFilter: (req, file, cb) => {
+    // Accept video, image, document, and audio files
+    const allowedTypes = /^(video|image|audio|application)\//;
+    if (allowedTypes.test(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only video, image, audio, and documents are allowed.'));
+    }
+  }
+});
 
 // All routes require authentication
 router.use(validateJWT);
+
+// ========== Media Library Routes ==========
+
+/**
+ * POST /api/media/upload
+ * Upload media file to WhatsApp and save to media library
+ */
+router.post('/upload', upload.single('file'), uploadMediaFile);
+
+/**
+ * GET /api/media/library
+ * Get all media across all WhatsApp numbers
+ */
+router.get('/library', getAllMedia);
+
+/**
+ * GET /api/media/library/:whatsappNumberId
+ * Get media library for specific WhatsApp number
+ */
+router.get('/library/:whatsappNumberId', getMediaLibrary);
+
+/**
+ * PATCH /api/media/library/:id
+ * Update media description
+ */
+router.patch('/library/:id', updateMedia);
+
+/**
+ * DELETE /api/media/library/:id
+ * Delete media from library
+ */
+router.delete('/library/:id', deleteMedia);
+
+// ========== Message Media Proxy Route ==========
 
 /**
  * GET /api/media/:messageId
